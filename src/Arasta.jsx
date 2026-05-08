@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect, useRef } from "react";
 
 const LIRA_TO_EURO = 51;
 const STORAGE_KEY = "arasta_atesi_v2_light";
+const SHEETS_URL = "https://script.google.com/macros/s/AKfycbwF_prRa9qPRcS2RwZYO1zfKgFS3mJlncJSXvCxrSSJ8iFQR6eJj4iApmkb2F1hQtU0XA/exec";
 
 const MENU_ITEMS = [
   { id: 1, name: "Et Pirzola", nameEn: "Lamb Chops", category: "Kebap", price: 600 },
@@ -44,7 +45,7 @@ const MENU_ITEMS = [
   { id: 40, name: "Seven Up", nameEn: "Seven Up", category: "İçecek", price: 60 },
   { id: 41, name: "Sıkma Portakal Suyu", nameEn: "Fresh Orange Juice", category: "İçecek", price: 100 },
   { id: 42, name: "Şalgam", nameEn: "Turnip Juice", category: "İçecek", price: 60 },
-  { id: 42, name: "Ayran", nameEn: "Ayran", category: "İçecek", price: 30 },
+  { id: 43, name: "Ayran", nameEn: "Ayran", category: "İçecek", price: 30 },
 ];
 
 const CATEGORIES = ["Tümü / All", "Kebap", "Dürüm", "Özel Menü", "Balık", "Salata", "Çorba", "Meze", "İçecek"];
@@ -70,6 +71,194 @@ function saveState(tables, orders, adjustments) {
   } catch (e) { console.warn("localStorage save failed:", e); }
 }
 
+// ── Sheets sync helpers ──────────────────────────────────────────────────────
+async function syncTableToSheets(tableId, status, guests, openedAt, items, total) {
+  const products = items.map(i => `${i.name} x${i.qty}`).join(", ");
+  const total_eur = (total / LIRA_TO_EURO).toFixed(2);
+  try {
+    await fetch(SHEETS_URL, {
+      method: "POST",
+      mode: "no-cors",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        action: "update",
+        table: tableId,
+        status,
+        guests,
+        products,
+        total_tl: total,
+        total_eur,
+        opened_at: openedAt,
+      }),
+    });
+  } catch (err) { console.warn("Sheets sync error:", err); }
+}
+
+async function closeTableOnSheets(tableId, items, total, time) {
+  const products = items.map(i => `${i.name} x${i.qty}`).join(", ");
+  const total_eur = (total / LIRA_TO_EURO).toFixed(2);
+  try {
+    await fetch(SHEETS_URL, {
+      method: "POST",
+      mode: "no-cors",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        action: "close",
+        time,
+        table: tableId,
+        products,
+        total_tl: total,
+        total_eur,
+      }),
+    });
+  } catch (err) { console.warn("Sheets close error:", err); }
+}
+
+// ── Live view component ──────────────────────────────────────────────────────
+function LiveView() {
+  const [liveData, setLiveData] = useState([]);
+  const [lastFetch, setLastFetch] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  const fetchLive = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(SHEETS_URL);
+      const data = await res.json();
+      setLiveData(Array.isArray(data) ? data : []);
+      setLastFetch(new Date());
+    } catch (err) {
+      setError("Bağlantı hatası · Connection error");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchLive();
+    const interval = setInterval(fetchLive, 30000);
+    return () => clearInterval(interval);
+  }, [fetchLive]);
+
+  const totalRevenue = liveData.reduce((s, r) => s + (parseFloat(r.total_tl) || 0), 0);
+
+  const statusColor = (status) => {
+    if (status === "bill") return { bg: "#fdf0f0", border: "#d09090", dot: "#b06060" };
+    if (status === "occupied") return { bg: "#faf3e0", border: "#d4b840", dot: "#8b6914" };
+    return { bg: "#f3f0ea", border: "#e8e2d8", dot: "#b0c0b0" };
+  };
+
+  return (
+    <div style={{ flex: 1, overflowY: "auto", padding: "20px 24px" }}>
+      {/* Live header bar */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+        <div>
+          <div style={{ fontSize: 9, letterSpacing: "0.18em", textTransform: "uppercase", color: "#9a8e7e", fontFamily: "'DM Mono',monospace", marginBottom: 4 }}>
+            Canlı Takip · Live Tracking
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ width: 8, height: 8, borderRadius: "50%", background: loading ? "#c4a84a" : "#2a6040", display: "inline-block", animation: loading ? "pulse 1s infinite" : "none" }} />
+            <span style={{ fontSize: 12, fontFamily: "'DM Mono',monospace", color: "#9a8e7e" }}>
+              {loading ? "Güncelleniyor · Updating..." : lastFetch ? `Son güncelleme · Last update: ${lastFetch.toLocaleTimeString()}` : "—"}
+            </span>
+            <span style={{ fontSize: 10, fontFamily: "'DM Mono',monospace", color: "#c0bab0" }}>· Otomatik 30s / Auto 30s</span>
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          {totalRevenue > 0 && (
+            <div style={{ background: "#faf3e0", border: "1px solid #d4b840", borderRadius: 6, padding: "8px 14px", textAlign: "right" }}>
+              <div style={{ fontSize: 9, letterSpacing: "0.12em", textTransform: "uppercase", color: "#9a8e7e", fontFamily: "'DM Mono',monospace" }}>Aktif Toplam · Active Total</div>
+              <div style={{ fontSize: 16, color: "#8b6914", fontFamily: "'DM Mono',monospace" }}>₺{totalRevenue.toLocaleString()} · €{(totalRevenue / LIRA_TO_EURO).toFixed(0)}</div>
+            </div>
+          )}
+          <button
+            onClick={fetchLive}
+            disabled={loading}
+            style={{ border: "1px solid #d8d0c0", background: "#fff", borderRadius: 5, padding: "7px 14px", fontSize: 12, fontFamily: "'DM Mono',monospace", cursor: loading ? "not-allowed" : "pointer", color: "#5a5040", opacity: loading ? 0.5 : 1 }}
+          >
+            ↻ Yenile / Refresh
+          </button>
+        </div>
+      </div>
+
+      {error && (
+        <div style={{ background: "#fdf0f0", border: "1px solid #d09090", borderRadius: 6, padding: "10px 16px", marginBottom: 16, fontSize: 13, color: "#8b2020", fontFamily: "'DM Mono',monospace" }}>
+          ⚠ {error}
+        </div>
+      )}
+
+      {liveData.length === 0 && !loading ? (
+        <div style={{ textAlign: "center", padding: "60px 20px", color: "#9a8e7e" }}>
+          <div style={{ fontSize: 32, marginBottom: 8 }}>🪑</div>
+          <p style={{ fontStyle: "italic", fontSize: 14 }}>Aktif masa yok · No active tables</p>
+        </div>
+      ) : (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))", gap: 14 }}>
+          {liveData.map((row, idx) => {
+            const colors = statusColor(row.status);
+            const tl = parseFloat(row.total_tl) || 0;
+            const eur = parseFloat(row.total_eur) || 0;
+            const products = row.products ? row.products.split(", ") : [];
+            const openedAt = row.opened_at ? new Date(row.opened_at) : null;
+            const updatedAt = row.updated_at ? new Date(row.updated_at) : null;
+
+            return (
+              <div key={idx} style={{ background: colors.bg, border: `1.5px solid ${colors.border}`, borderRadius: 8, overflow: "hidden" }}>
+                {/* Card header */}
+                <div style={{ padding: "12px 16px", borderBottom: `1px solid ${colors.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={{ width: 8, height: 8, borderRadius: "50%", background: colors.dot, display: "inline-block" }} />
+                    <span style={{ fontSize: 18, fontWeight: 500, color: "#8b6914" }}>Masa {row.table} · Table {row.table}</span>
+                  </div>
+                  <span style={{
+                    fontSize: 10, fontFamily: "'DM Mono',monospace", padding: "2px 8px", borderRadius: 3,
+                    background: row.status === "bill" ? "#fdf0f0" : row.status === "occupied" ? "#faf3e0" : "#f3f0ea",
+                    color: row.status === "bill" ? "#8b2020" : row.status === "occupied" ? "#8b6914" : "#9a8e7e",
+                    border: `1px solid ${colors.border}`,
+                  }}>
+                    {row.status === "bill" ? "💳 Hesap/Bill" : row.status === "occupied" ? "● Dolu/Occupied" : "○ Boş/Free"}
+                  </span>
+                </div>
+
+                {/* Items */}
+                <div style={{ padding: "10px 16px" }}>
+                  {products.length > 0 ? (
+                    <div style={{ marginBottom: 10 }}>
+                      {products.map((p, i) => (
+                        <div key={i} style={{ fontSize: 13, color: "#5a5040", padding: "2px 0", borderBottom: i < products.length - 1 ? "1px solid rgba(0,0,0,0.04)" : "none", display: "flex", alignItems: "center", gap: 6 }}>
+                          <span style={{ color: "#c4a84a", fontSize: 10 }}>▸</span>
+                          {p}
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div style={{ fontSize: 12, color: "#9a8e7e", fontStyle: "italic", marginBottom: 10 }}>Sipariş yok · No orders</div>
+                  )}
+
+                  {/* Total */}
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", borderTop: `1px solid ${colors.border}`, paddingTop: 8, marginTop: 4 }}>
+                    <div style={{ fontSize: 10, fontFamily: "'DM Mono',monospace", color: "#9a8e7e" }}>
+                      {openedAt && <div>Açılış: {openedAt.toLocaleTimeString()}</div>}
+                      {updatedAt && <div>Güncelleme: {updatedAt.toLocaleTimeString()}</div>}
+                    </div>
+                    <div style={{ textAlign: "right" }}>
+                      <div style={{ fontSize: 20, color: "#8b6914", fontFamily: "'DM Mono',monospace" }}>₺{tl.toLocaleString()}</div>
+                      <div style={{ fontSize: 11, color: "#9a8e7e", fontFamily: "'DM Mono',monospace" }}>€{eur.toFixed(2)}</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Main component ───────────────────────────────────────────────────────────
 export default function ArastaAtesi() {
   const saved = loadState();
 
@@ -82,106 +271,107 @@ export default function ArastaAtesi() {
   const [categoryFilter, setCategoryFilter] = useState("Tümü / All");
   const [toast, setToast] = useState(null);
   const [guestInput, setGuestInput] = useState("2");
-  const [noteInputs, setNoteInputs] = useState({});
   const [adjLabel, setAdjLabel] = useState("");
   const [adjAmount, setAdjAmount] = useState("");
 
   const isFirstRender = useRef(true);
+  const syncDebounceRef = useRef({});
+
+  // ── Persist to localStorage ──
   useEffect(() => {
     if (isFirstRender.current) { isFirstRender.current = false; return; }
     saveState(tables, orders, adjustments);
   }, [tables, orders, adjustments]);
+
+  // ── Debounced Sheets sync on order/adjustment change ──
+  const scheduleSync = useCallback((tableId, tablesSnapshot, ordersSnapshot, adjustmentsSnapshot) => {
+    if (syncDebounceRef.current[tableId]) clearTimeout(syncDebounceRef.current[tableId]);
+    syncDebounceRef.current[tableId] = setTimeout(() => {
+      const table = tablesSnapshot.find(t => t.id === tableId);
+      if (!table || table.status === "free") return;
+      const items = ordersSnapshot[tableId] || [];
+      const subtotal = items.reduce((s, i) => s + (i.price || 0) * i.qty, 0);
+      const adjTot = (adjustmentsSnapshot[tableId] || []).reduce((s, a) => s + a.amount, 0);
+      syncTableToSheets(tableId, table.status, table.guests, table.openedAt, items, subtotal + adjTot);
+    }, 2000);
+  }, []);
 
   const showToast = useCallback((msg) => {
     setToast(msg);
     setTimeout(() => setToast(null), 2200);
   }, []);
 
-  // --- Table actions ---
+  // ── Table actions ──
   const openTable = (tableId) => {
     const guests = parseInt(guestInput) || 2;
-    setTables(prev => prev.map(t => t.id === tableId ? { ...t, status: "occupied", guests, openedAt: new Date().toISOString() } : t));
-    setOrders(prev => ({ ...prev, [tableId]: [] }));
-    setAdjustments(prev => ({ ...prev, [tableId]: [] }));
+    const openedAt = new Date().toISOString();
+    const newTables = tables.map(t => t.id === tableId ? { ...t, status: "occupied", guests, openedAt } : t);
+    const newOrders = { ...orders, [tableId]: [] };
+    const newAdj = { ...adjustments, [tableId]: [] };
+    setTables(newTables);
+    setOrders(newOrders);
+    setAdjustments(newAdj);
     setGuestInput("2");
+    syncTableToSheets(tableId, "occupied", guests, openedAt, [], 0);
     showToast(`Masa ${tableId} açıldı / Table ${tableId} opened`);
   };
 
   const closeTable = async (tableId) => {
-  const items = orders[tableId] || [];
+    const items = orders[tableId] || [];
+    const subtotal = items.reduce((s, i) => s + (i.price || 0) * i.qty, 0);
+    const adjTot = (adjustments[tableId] || []).reduce((s, a) => s + a.amount, 0);
+    const total = subtotal + adjTot;
+    const time = new Date().toISOString();
 
-  const products = items
-    .map(i => `${i.name} x${i.qty}`)
-    .join(", ");
+    await closeTableOnSheets(tableId, items, total, time);
 
-  const total = getTotal(tableId);
-
-  try {
-    await fetch("https://script.google.com/macros/s/AKfycbwF_prRa9qPRcS2RwZYO1zfKgFS3mJlncJSXvCxrSSJ8iFQR6eJj4iApmkb2F1hQtU0XA/exec", {
-      method: "POST",
-      body: JSON.stringify({
-        time: new Date().toISOString(),
-        table: tableId,
-        products,
-        total_price: total,
-      }),
-    });
-  } catch (err) {
-    console.error("Google Sheets error:", err);
-  }
-
-  setTables(prev =>
-    prev.map(t =>
-      t.id === tableId
-        ? { ...t, status: "free", guests: 0, openedAt: null }
-        : t
-    )
-  );
-
-  setOrders(prev => {
-    const n = { ...prev };
-    delete n[tableId];
-    return n;
-  });
-
-  setAdjustments(prev => {
-    const n = { ...prev };
-    delete n[tableId];
-    return n;
-  });
-
-  setSelectedTable(null);
-
-  showToast(`Masa ${tableId} kapatıldı / Table ${tableId} closed`);
-};
+    setTables(prev => prev.map(t => t.id === tableId ? { ...t, status: "free", guests: 0, openedAt: null } : t));
+    setOrders(prev => { const n = { ...prev }; delete n[tableId]; return n; });
+    setAdjustments(prev => { const n = { ...prev }; delete n[tableId]; return n; });
+    setSelectedTable(null);
+    showToast(`Masa ${tableId} kapatıldı / Table ${tableId} closed`);
+  };
 
   const requestBill = (tableId) => {
-    setTables(prev => prev.map(t => t.id === tableId ? { ...t, status: "bill" } : t));
+    const newTables = tables.map(t => t.id === tableId ? { ...t, status: "bill" } : t);
+    setTables(newTables);
+    // Sync bill status immediately
+    const table = newTables.find(t => t.id === tableId);
+    const items = orders[tableId] || [];
+    const subtotal = items.reduce((s, i) => s + (i.price || 0) * i.qty, 0);
+    const adjTot = (adjustments[tableId] || []).reduce((s, a) => s + a.amount, 0);
+    syncTableToSheets(tableId, "bill", table.guests, table.openedAt, items, subtotal + adjTot);
     showToast(`Masa ${tableId} hesap / Table ${tableId} bill requested`);
   };
 
-  // --- Order actions ---
+  // ── Order actions ──
   const addItem = (tableId, menuItem) => {
     setOrders(prev => {
       const current = prev[tableId] || [];
       const existing = current.find(i => i.menuId === menuItem.id);
-      if (existing) {
-        return { ...prev, [tableId]: current.map(i => i.menuId === menuItem.id ? { ...i, qty: i.qty + 1 } : i) };
-      }
-      return { ...prev, [tableId]: [...current, { id: Date.now(), menuId: menuItem.id, name: menuItem.name, nameEn: menuItem.nameEn, price: menuItem.price, qty: 1, note: "", status: "pending" }] };
+      const newOrders = existing
+        ? { ...prev, [tableId]: current.map(i => i.menuId === menuItem.id ? { ...i, qty: i.qty + 1 } : i) }
+        : { ...prev, [tableId]: [...current, { id: Date.now(), menuId: menuItem.id, name: menuItem.name, nameEn: menuItem.nameEn, price: menuItem.price, qty: 1, note: "", status: "pending" }] };
+      scheduleSync(tableId, tables, newOrders, adjustments);
+      return newOrders;
     });
     showToast(`${menuItem.name} eklendi / added`);
   };
 
   const updateQty = (tableId, itemId, delta) => {
-    setOrders(prev => ({
-      ...prev,
-      [tableId]: (prev[tableId] || []).map(i => i.id === itemId ? { ...i, qty: i.qty + delta } : i).filter(i => i.qty > 0),
-    }));
+    setOrders(prev => {
+      const newOrders = { ...prev, [tableId]: (prev[tableId] || []).map(i => i.id === itemId ? { ...i, qty: i.qty + delta } : i).filter(i => i.qty > 0) };
+      scheduleSync(tableId, tables, newOrders, adjustments);
+      return newOrders;
+    });
   };
 
   const removeItem = (tableId, itemId) => {
-    setOrders(prev => ({ ...prev, [tableId]: (prev[tableId] || []).filter(i => i.id !== itemId) }));
+    setOrders(prev => {
+      const newOrders = { ...prev, [tableId]: (prev[tableId] || []).filter(i => i.id !== itemId) };
+      scheduleSync(tableId, tables, newOrders, adjustments);
+      return newOrders;
+    });
   };
 
   const updateNote = (tableId, itemId, note) => {
@@ -192,16 +382,21 @@ export default function ArastaAtesi() {
     setOrders(prev => ({ ...prev, [tableId]: (prev[tableId] || []).map(i => i.id === itemId ? { ...i, status: "served" } : i) }));
   };
 
-  // --- Adjustment actions ---
+  // ── Adjustment actions ──
   const addAdjustment = (tableId, label, amount) => {
-    setAdjustments(prev => ({
-      ...prev,
-      [tableId]: [...(prev[tableId] || []), { id: Date.now(), label, amount }],
-    }));
+    setAdjustments(prev => {
+      const newAdj = { ...prev, [tableId]: [...(prev[tableId] || []), { id: Date.now(), label, amount }] };
+      scheduleSync(tableId, tables, orders, newAdj);
+      return newAdj;
+    });
   };
 
   const removeAdjustment = (tableId, adjId) => {
-    setAdjustments(prev => ({ ...prev, [tableId]: (prev[tableId] || []).filter(a => a.id !== adjId) }));
+    setAdjustments(prev => {
+      const newAdj = { ...prev, [tableId]: (prev[tableId] || []).filter(a => a.id !== adjId) };
+      scheduleSync(tableId, tables, orders, newAdj);
+      return newAdj;
+    });
   };
 
   const applyAdj = (tableId, sign) => {
@@ -215,12 +410,12 @@ export default function ArastaAtesi() {
     addAdjustment(tableId, amount > 0 ? "Ekleme / Addition" : "İndirim / Discount", amount);
   };
 
-  // --- Totals ---
+  // ── Totals ──
   const getSubtotal = (tableId) => (orders[tableId] || []).reduce((s, i) => s + (i.price || 0) * i.qty, 0);
   const getAdjTotal = (tableId) => (adjustments[tableId] || []).reduce((s, a) => s + a.amount, 0);
   const getTotal = (tableId) => getSubtotal(tableId) + getAdjTotal(tableId);
 
-  // --- Export / Reset ---
+  // ── Export / Reset ──
   const exportCSV = () => {
     const rows = [["Masa/Table", "Durum/Status", "Misafir/Guests", "Ürün/Item", "İng./En", "Adet/Qty", "Fiyat TL", "Fiyat EUR", "Not/Note", "Durum/Status"]];
     tables.forEach(t => {
@@ -242,7 +437,7 @@ export default function ArastaAtesi() {
     showToast("Veriler temizlendi / Data cleared");
   };
 
-  // --- Derived ---
+  // ── Derived ──
   const pendingCount = Object.values(orders).flat().filter(i => i.status === "pending").length;
   const occupiedCount = tables.filter(t => t.status !== "free").length;
   const totalRevenue = Object.keys(orders).reduce((s, tid) => s + getTotal(parseInt(tid)), 0);
@@ -304,6 +499,7 @@ export default function ArastaAtesi() {
         input[type="text"]:focus, input[type="number"]:focus { border-color: #8b6914; background: #fff; }
         .toast { position: fixed; bottom: 20px; right: 20px; padding: 10px 18px; border-radius: 6px; font-size: 13px; font-family: 'DM Mono', monospace; z-index: 9999; border: 1px solid #d8d0c0; background: #fff; color: #5a5040; box-shadow: 0 4px 16px rgba(0,0,0,0.1); animation: toastIn 0.2s ease; }
         @keyframes toastIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
         .section-label { font-size: 9px; letter-spacing: 0.18em; text-transform: uppercase; color: #9a8e7e; font-family: 'DM Mono', monospace; margin-bottom: 10px; }
         .mono { font-family: 'DM Mono', monospace; }
       `}</style>
@@ -322,10 +518,14 @@ export default function ArastaAtesi() {
           <button className="btn danger sm" onClick={clearAll}>Sıfırla / Reset</button>
           <button className="btn sm" onClick={exportCSV}>↓ CSV</button>
           <div style={{ display: "flex", background: "#f3f0ea", border: "1px solid #e8e2d8", borderRadius: 6, padding: 3, gap: 2 }}>
-            {["floor", "kitchen"].map(v => (
-              <button key={v} className={`tab${view === v ? " active" : ""}`} onClick={() => setView(v)}>
-                {v === "floor" ? "Masalar / Tables" : "Mutfak / Kitchen"}
-                {v === "kitchen" && pendingCount > 0 && <span className="badge">{pendingCount}</span>}
+            {[
+              { key: "floor", labelTr: "Masalar", labelEn: "Tables" },
+              { key: "kitchen", labelTr: "Mutfak", labelEn: "Kitchen" },
+              { key: "live", labelTr: "Canlı", labelEn: "Live" },
+            ].map(v => (
+              <button key={v.key} className={`tab${view === v.key ? " active" : ""}`} onClick={() => setView(v.key)}>
+                {v.labelTr} / {v.labelEn}
+                {v.key === "kitchen" && pendingCount > 0 && <span className="badge">{pendingCount}</span>}
               </button>
             ))}
           </div>
@@ -390,7 +590,6 @@ export default function ArastaAtesi() {
                     </div>
                   </div>
                 : <>
-                    {/* Table header */}
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 }}>
                       <div>
                         <div style={{ fontSize: 20, color: "#8b6914", fontWeight: 500 }}>Masa {selectedTable} · Table {selectedTable}</div>
@@ -402,7 +601,6 @@ export default function ArastaAtesi() {
                       </div>
                     </div>
 
-                    {/* Orders */}
                     <div style={{ background: "#fff", border: "1px solid #e8e2d8", borderRadius: 8, marginBottom: 12, overflow: "hidden" }}>
                       <div style={{ padding: "12px 16px", borderBottom: "1px solid #ece8df", background: "#faf8f4", display: "flex", justifyContent: "space-between" }}>
                         <span className="mono" style={{ fontSize: 11, color: "#9a8e7e", letterSpacing: "0.08em" }}>SİPARİŞ · ORDERS</span>
@@ -447,10 +645,8 @@ export default function ArastaAtesi() {
                         ))}
                     </div>
 
-                    {/* Adjustments + Total */}
                     <div style={{ background: "#fff", border: "1px solid #e8e2d8", borderRadius: 8, padding: 16 }}>
                       <div className="section-label">Fiyat Düzenleme · Price Adjustment</div>
-
                       {selectedAdj.length > 0 && (
                         <div style={{ marginBottom: 10 }}>
                           {selectedAdj.map(a => (
@@ -466,7 +662,6 @@ export default function ArastaAtesi() {
                           ))}
                         </div>
                       )}
-
                       <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
                         <input type="text" placeholder="Açıklama · Description" value={adjLabel} onChange={e => setAdjLabel(e.target.value)} style={{ flex: 2 }} />
                         <input type="number" placeholder="₺ tutar" value={adjAmount} onChange={e => setAdjAmount(e.target.value)} style={{ width: 100, flexShrink: 0 }} />
@@ -479,9 +674,7 @@ export default function ArastaAtesi() {
                         <button className="btn green sm" onClick={() => applyAdj(selectedTable, 1)}>+ Ekle/Add</button>
                         <button className="btn warn sm" onClick={() => applyAdj(selectedTable, -1)}>− İndir/Discount</button>
                       </div>
-
                       <div style={{ height: 1, background: "#e8e2d8", margin: "12px 0" }} />
-
                       <div style={{ display: "flex", justifyContent: "space-between", padding: "3px 0" }}>
                         <span className="mono" style={{ fontSize: 12, color: "#9a8e7e" }}>Ara Toplam / Subtotal</span>
                         <span className="mono" style={{ fontSize: 13, color: "#5a5040" }}>₺{subtotal.toLocaleString()} · €{(subtotal / LIRA_TO_EURO).toFixed(1)}</span>
@@ -558,7 +751,7 @@ export default function ArastaAtesi() {
             : <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(280px,1fr))", gap: 12 }}>
                 {Object.entries(orders).filter(([, items]) => items.length > 0).map(([tid, items]) => {
                   const table = tables.find(t => t.id === parseInt(tid));
-                  const total = getTotal(parseInt(tid));
+                  const tot = getTotal(parseInt(tid));
                   return (
                     <div key={tid} style={{ background: "#fff", border: "1px solid #d8d0c0", borderRadius: 8, overflow: "hidden" }}>
                       <div style={{ padding: "12px 16px", borderBottom: "1px solid #ece8df", background: "#faf8f4", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
@@ -567,8 +760,8 @@ export default function ArastaAtesi() {
                           <span className="mono" style={{ fontSize: 11, color: "#9a8e7e", marginLeft: 8 }}>{table?.guests} kişi/guests</span>
                         </div>
                         <div style={{ textAlign: "right" }}>
-                          <div className="mono" style={{ fontSize: 13, color: "#8b6914" }}>₺{total.toLocaleString()}</div>
-                          <div className="mono" style={{ fontSize: 10, color: "#9a8e7e" }}>€{(total / LIRA_TO_EURO).toFixed(1)}</div>
+                          <div className="mono" style={{ fontSize: 13, color: "#8b6914" }}>₺{tot.toLocaleString()}</div>
+                          <div className="mono" style={{ fontSize: 10, color: "#9a8e7e" }}>€{(tot / LIRA_TO_EURO).toFixed(1)}</div>
                         </div>
                       </div>
                       {items.map(item => (
@@ -590,6 +783,9 @@ export default function ArastaAtesi() {
               </div>}
         </div>
       )}
+
+      {/* Live View */}
+      {view === "live" && <LiveView />}
     </div>
   );
 }
