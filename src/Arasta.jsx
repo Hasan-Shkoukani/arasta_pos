@@ -1,8 +1,8 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 
 const LIRA_TO_EURO = 51;
-const STORAGE_KEY = "arasta_atesi_v2_light";
-const SHEETS_URL = "https://script.google.com/macros/s/AKfycbzr_VVD9dEoy9vrD2pP-FE1CTezNnfPr5lc1ka5f5KvABf9SPQXdhAA5zNN0KADXfK8cw/exec";
+const STORAGE_KEY = "arasta_atesi_v3";
+const SHEETS_URL = "https://script.google.com/macros/s/AKfycbx1pXs65UhFQidKnKagk5t_flBhD_oQiahxHbF-Tlp6glTvEl1Of0TQ95bFpY1kInPQ/exec";
 
 const MENU_ITEMS = [
   { id: 1, name: "Et Pirzola", nameEn: "Lamb Chops", category: "Kebap", price: 600 },
@@ -71,108 +71,16 @@ function saveState(tables, orders, adjustments) {
   } catch (e) { console.warn("localStorage save failed:", e); }
 }
 
-// ── Retry queue for failed log attempts ──────────────────────────────────────
-const failedLogs = [];
-let retryIntervalId = null;
-
-// Formats items array into string like "Adana x2, Cola x1"
-function formatItems(items) {
-  return items.map(i => `${i.name} x${i.qty}`).join(", ");
-}
-
-// Reusable function to log closed table to Google Apps Script.
-// Handles retries on failure and doesn't block the UI.
-async function logClosedTable(tableId, items, total) {
-  const payload = {
-    action: "close",
+function sendCloseToSheets(tableId, items, total) {
+  const params = new URLSearchParams({
     time: new Date().toISOString(),
-    items: formatItems(items),
-    total_tl: total,
-  };
-
-  const attemptLog = async () => {
-    try {
-      const res = await fetch(SHEETS_URL, {
-        method: "POST",
-        mode: "no-cors",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      
-      // With no-cors mode, we can't read the response
-      // But that's OK - Google Apps Script will process the request
-      
-      console.log("✓ Table closed logged to Sheets:", { tableId, items: payload.items, total });
-      return true;
-    } catch (err) {
-      console.warn(`✗ Failed to log closed table ${tableId}:`, err.message);
-      return false;
-    }
-  };
-
-  // Try immediately
-  const success = await attemptLog();
-  
-  // If failed, add to retry queue
-  if (!success) {
-    failedLogs.push(payload);
-    console.log(`Added table ${tableId} to retry queue. Pending: ${failedLogs.length}`);
-    
-    // Start retry interval if not already running
-    if (!retryIntervalId) {
-      retryIntervalId = setInterval(async () => {
-        if (failedLogs.length === 0) {
-          clearInterval(retryIntervalId);
-          retryIntervalId = null;
-          return;
-        }
-        
-        const toRetry = failedLogs.shift();
-        try {
-          const res = await fetch(SHEETS_URL, {
-            method: "POST",
-            mode: "no-cors",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(toRetry),
-          });
-          
-          // With no-cors mode, we can't check response status
-          // Assume success for retry loop
-          
-          console.log("✓ Retried log successful:", toRetry);
-        } catch (err) {
-          failedLogs.push(toRetry);
-          console.warn(`Retry error for table close:`, err.message);
-        }
-      }, 10000); // Retry every 10 seconds
-    }
-  }
+    table: tableId,
+    items: items.map(i => `${i.name} x${i.qty}`).join(", "),
+    total,
+  });
+  fetch(`${SHEETS_URL}?${params.toString()}`, { mode: "no-cors" });
 }
 
-// Sheets sync helpers (for live updates - not critical for closing)
-async function syncTableToSheets(tableId, status, guests, openedAt, items, total) {
-  const products = items.map(i => `${i.name} x${i.qty}`).join(", ");
-  try {
-    await fetch(SHEETS_URL, {
-      method: "POST",
-      mode: "no-cors",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        action: "update",
-        table: tableId,
-        status,
-        guests,
-        products,
-        total_tl: total,
-        opened_at: openedAt,
-      }),
-    });
-  } catch (err) { console.warn("Sheets sync error:", err); }
-}
-
-// ── Removed: LiveView component
-
-// ── Main component ───────────────────────────────────────────────────────────
 export default function ArastaAtesi() {
   const saved = loadState();
 
@@ -189,26 +97,11 @@ export default function ArastaAtesi() {
   const [adjAmount, setAdjAmount] = useState("");
 
   const isFirstRender = useRef(true);
-  const syncDebounceRef = useRef({});
 
-  // ── Persist to localStorage ──
   useEffect(() => {
     if (isFirstRender.current) { isFirstRender.current = false; return; }
     saveState(tables, orders, adjustments);
   }, [tables, orders, adjustments]);
-
-  // ── Debounced Sheets sync on order/adjustment change ──
-  const scheduleSync = useCallback((tableId, tablesSnapshot, ordersSnapshot, adjustmentsSnapshot) => {
-    if (syncDebounceRef.current[tableId]) clearTimeout(syncDebounceRef.current[tableId]);
-    syncDebounceRef.current[tableId] = setTimeout(() => {
-      const table = tablesSnapshot.find(t => t.id === tableId);
-      if (!table || table.status === "free") return;
-      const items = ordersSnapshot[tableId] || [];
-      const subtotal = items.reduce((s, i) => s + (i.price || 0) * i.qty, 0);
-      const adjTot = (adjustmentsSnapshot[tableId] || []).reduce((s, a) => s + a.amount, 0);
-      syncTableToSheets(tableId, table.status, table.guests, table.openedAt, items, subtotal + adjTot);
-    }, 2000);
-  }, []);
 
   const showToast = useCallback((msg) => {
     setToast(msg);
@@ -219,14 +112,10 @@ export default function ArastaAtesi() {
   const openTable = (tableId) => {
     const guests = parseInt(guestInput) || 2;
     const openedAt = new Date().toISOString();
-    const newTables = tables.map(t => t.id === tableId ? { ...t, status: "occupied", guests, openedAt } : t);
-    const newOrders = { ...orders, [tableId]: [] };
-    const newAdj = { ...adjustments, [tableId]: [] };
-    setTables(newTables);
-    setOrders(newOrders);
-    setAdjustments(newAdj);
+    setTables(prev => prev.map(t => t.id === tableId ? { ...t, status: "occupied", guests, openedAt } : t));
+    setOrders(prev => ({ ...prev, [tableId]: [] }));
+    setAdjustments(prev => ({ ...prev, [tableId]: [] }));
     setGuestInput("2");
-    syncTableToSheets(tableId, "occupied", guests, openedAt, [], 0);
     showToast(`Masa ${tableId} açıldı / Table ${tableId} opened`);
   };
 
@@ -236,10 +125,8 @@ export default function ArastaAtesi() {
     const adjTot = (adjustments[tableId] || []).reduce((s, a) => s + a.amount, 0);
     const total = subtotal + adjTot;
 
-    // Log closed table (non-blocking - doesn't wait for response)
-    logClosedTable(tableId, items, total);
+    sendCloseToSheets(tableId, items, total);
 
-    // Reset table state immediately - UI remains responsive
     setTables(prev => prev.map(t => t.id === tableId ? { ...t, status: "free", guests: 0, openedAt: null } : t));
     setOrders(prev => { const n = { ...prev }; delete n[tableId]; return n; });
     setAdjustments(prev => { const n = { ...prev }; delete n[tableId]; return n; });
@@ -248,14 +135,7 @@ export default function ArastaAtesi() {
   };
 
   const requestBill = (tableId) => {
-    const newTables = tables.map(t => t.id === tableId ? { ...t, status: "bill" } : t);
-    setTables(newTables);
-    // Sync bill status immediately
-    const table = newTables.find(t => t.id === tableId);
-    const items = orders[tableId] || [];
-    const subtotal = items.reduce((s, i) => s + (i.price || 0) * i.qty, 0);
-    const adjTot = (adjustments[tableId] || []).reduce((s, a) => s + a.amount, 0);
-    syncTableToSheets(tableId, "bill", table.guests, table.openedAt, items, subtotal + adjTot);
+    setTables(prev => prev.map(t => t.id === tableId ? { ...t, status: "bill" } : t));
     showToast(`Masa ${tableId} hesap / Table ${tableId} bill requested`);
   };
 
@@ -264,29 +144,22 @@ export default function ArastaAtesi() {
     setOrders(prev => {
       const current = prev[tableId] || [];
       const existing = current.find(i => i.menuId === menuItem.id);
-      const newOrders = existing
+      return existing
         ? { ...prev, [tableId]: current.map(i => i.menuId === menuItem.id ? { ...i, qty: i.qty + 1 } : i) }
         : { ...prev, [tableId]: [...current, { id: Date.now(), menuId: menuItem.id, name: menuItem.name, nameEn: menuItem.nameEn, price: menuItem.price, qty: 1, note: "", status: "pending" }] };
-      scheduleSync(tableId, tables, newOrders, adjustments);
-      return newOrders;
     });
     showToast(`${menuItem.name} eklendi / added`);
   };
 
   const updateQty = (tableId, itemId, delta) => {
-    setOrders(prev => {
-      const newOrders = { ...prev, [tableId]: (prev[tableId] || []).map(i => i.id === itemId ? { ...i, qty: i.qty + delta } : i).filter(i => i.qty > 0) };
-      scheduleSync(tableId, tables, newOrders, adjustments);
-      return newOrders;
-    });
+    setOrders(prev => ({
+      ...prev,
+      [tableId]: (prev[tableId] || []).map(i => i.id === itemId ? { ...i, qty: i.qty + delta } : i).filter(i => i.qty > 0),
+    }));
   };
 
   const removeItem = (tableId, itemId) => {
-    setOrders(prev => {
-      const newOrders = { ...prev, [tableId]: (prev[tableId] || []).filter(i => i.id !== itemId) };
-      scheduleSync(tableId, tables, newOrders, adjustments);
-      return newOrders;
-    });
+    setOrders(prev => ({ ...prev, [tableId]: (prev[tableId] || []).filter(i => i.id !== itemId) }));
   };
 
   const updateNote = (tableId, itemId, note) => {
@@ -299,19 +172,11 @@ export default function ArastaAtesi() {
 
   // ── Adjustment actions ──
   const addAdjustment = (tableId, label, amount) => {
-    setAdjustments(prev => {
-      const newAdj = { ...prev, [tableId]: [...(prev[tableId] || []), { id: Date.now(), label, amount }] };
-      scheduleSync(tableId, tables, orders, newAdj);
-      return newAdj;
-    });
+    setAdjustments(prev => ({ ...prev, [tableId]: [...(prev[tableId] || []), { id: Date.now(), label, amount }] }));
   };
 
   const removeAdjustment = (tableId, adjId) => {
-    setAdjustments(prev => {
-      const newAdj = { ...prev, [tableId]: (prev[tableId] || []).filter(a => a.id !== adjId) };
-      scheduleSync(tableId, tables, orders, newAdj);
-      return newAdj;
-    });
+    setAdjustments(prev => ({ ...prev, [tableId]: (prev[tableId] || []).filter(a => a.id !== adjId) }));
   };
 
   const applyAdj = (tableId, sign) => {
@@ -414,57 +279,30 @@ export default function ArastaAtesi() {
         input[type="text"]:focus, input[type="number"]:focus { border-color: #8b6914; background: #fff; }
         .toast { position: fixed; bottom: 20px; right: 20px; padding: 10px 18px; border-radius: 6px; font-size: 13px; font-family: 'DM Mono', monospace; z-index: 9999; border: 1px solid #d8d0c0; background: #fff; color: #5a5040; box-shadow: 0 4px 16px rgba(0,0,0,0.1); animation: toastIn 0.2s ease; }
         @keyframes toastIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
-        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
         .section-label { font-size: 9px; letter-spacing: 0.18em; text-transform: uppercase; color: #9a8e7e; font-family: 'DM Mono', monospace; margin-bottom: 10px; }
         .mono { font-family: 'DM Mono', monospace; }
-        
-        /* RESPONSIVE DESIGN */
-        @media (max-width: 1024px) {
-          .btn.sm { padding: 5px 12px; font-size: 12px; }
-          input[type="text"], input[type="number"] { padding: 6px 10px; font-size: 14px; }
-        }
-        
-        @media (max-width: 768px) {
-          .btn { padding: 8px 12px; font-size: 13px; }
-          .btn.sm { padding: 6px 12px; font-size: 12px; }
-          .qty-btn { width: 28px; height: 28px; font-size: 16px; }
-          input[type="text"], input[type="number"] { padding: 8px 12px; font-size: 16px; }
-          .tab { padding: 8px 12px; font-size: 13px; }
-          .cat-btn { padding: 6px 12px; font-size: 12px; }
-          .toast { bottom: 10px; right: 10px; font-size: 12px; padding: 8px 14px; }
-        }
-        
-        @media (max-width: 480px) {
-          .btn { padding: 10px 12px; font-size: 14px; }
-          .btn.sm { padding: 8px 12px; font-size: 13px; }
-          .qty-btn { width: 32px; height: 32px; font-size: 18px; }
-          .tab { padding: 8px 10px; font-size: 12px; }
-          .cat-btn { padding: 6px 10px; font-size: 11px; }
-          input[type="text"], input[type="number"] { padding: 10px 12px; font-size: 16px; }
-          .toast { font-size: 13px; padding: 10px 16px; bottom: 10px; right: 10px; }
-        }
       `}</style>
 
       {toast && <div className="toast">{toast}</div>}
 
       {/* Header */}
-      <div style={{ background: "#fff", borderBottom: "1px solid #d8d0c0", padding: "0 16px", display: "flex", alignItems: "center", justifyContent: "space-between", minHeight: 64, flexShrink: 0, boxShadow: "0 1px 8px rgba(0,0,0,0.05)", flexWrap: "wrap", gap: 12 }}>
-        <div style={{ minWidth: 200 }}>
-          <div style={{ fontSize: "clamp(8px, 2vw, 9px)", letterSpacing: "0.2em", textTransform: "uppercase", color: "#9a8e7e" }}>Mersin · Türkiye</div>
-          <div style={{ fontSize: "clamp(18px, 5vw, 22px)", fontWeight: 500, color: "#8b6914", letterSpacing: "0.08em", lineHeight: 1 }}>ARASTA ATEŞİ</div>
-          <div style={{ fontSize: "clamp(9px, 2vw, 10px)", color: "#9a8e7e", fontStyle: "italic" }}>Ateşin Gerçek Lezzeti</div>
+      <div style={{ background: "#fff", borderBottom: "1px solid #d8d0c0", padding: "0 24px", display: "flex", alignItems: "center", justifyContent: "space-between", height: 64, flexShrink: 0, boxShadow: "0 1px 8px rgba(0,0,0,0.05)" }}>
+        <div>
+          <div style={{ fontSize: 9, letterSpacing: "0.2em", textTransform: "uppercase", color: "#9a8e7e" }}>Mersin · Türkiye</div>
+          <div style={{ fontSize: 22, fontWeight: 500, color: "#8b6914", letterSpacing: "0.08em", lineHeight: 1 }}>ARASTA ATEŞİ</div>
+          <div style={{ fontSize: 10, color: "#9a8e7e", fontStyle: "italic" }}>Ateşin Gerçek Lezzeti · The True Taste of Fire</div>
         </div>
-        <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
-          <span style={{ fontSize: 10, color: "#b0a898", fontFamily: "'DM Mono',monospace", display: "none" }}>● Auto-save</span>
-          <button className="btn danger sm" onClick={clearAll} style={{ fontSize: "clamp(11px, 3vw, 12px)", padding: "clamp(4px, 2vh, 6px) clamp(8px, 3vw, 12px)" }}>Sıfırla</button>
-          <button className="btn sm" onClick={exportCSV} style={{ fontSize: "clamp(11px, 3vw, 12px)", padding: "clamp(4px, 2vh, 6px) clamp(8px, 3vw, 12px)" }}>↓ CSV</button>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <span style={{ fontSize: 10, color: "#b0a898", fontFamily: "'DM Mono',monospace" }}>● Auto-save</span>
+          <button className="btn danger sm" onClick={clearAll}>Sıfırla / Reset</button>
+          <button className="btn sm" onClick={exportCSV}>↓ CSV</button>
           <div style={{ display: "flex", background: "#f3f0ea", border: "1px solid #e8e2d8", borderRadius: 6, padding: 3, gap: 2 }}>
             {[
               { key: "floor", labelTr: "Masalar", labelEn: "Tables" },
               { key: "kitchen", labelTr: "Mutfak", labelEn: "Kitchen" },
             ].map(v => (
-              <button key={v.key} className={`tab${view === v.key ? " active" : ""}`} onClick={() => setView(v.key)} style={{ padding: "clamp(6px, 2vh, 8px) clamp(8px, 2vw, 12px)", fontSize: "clamp(10px, 2vw, 12px)" }}>
-                <span style={{ display: window.innerWidth < 640 ? "none" : "inline" }}>{v.labelTr} / </span>{v.labelEn}
+              <button key={v.key} className={`tab${view === v.key ? " active" : ""}`} onClick={() => setView(v.key)}>
+                {v.labelTr} / {v.labelEn}
                 {v.key === "kitchen" && pendingCount > 0 && <span className="badge">{pendingCount}</span>}
               </button>
             ))}
@@ -473,39 +311,39 @@ export default function ArastaAtesi() {
       </div>
 
       {/* Stats */}
-      <div style={{ display: "flex", gap: 8, padding: "clamp(8px, 2vh, 12px) clamp(12px, 3vw, 24px)", background: "#fff", borderBottom: "1px solid #ece8df", flexShrink: 0, flexWrap: "wrap", overflowX: "auto" }}>
+      <div style={{ display: "flex", gap: 10, padding: "12px 24px", background: "#fff", borderBottom: "1px solid #ece8df", flexShrink: 0 }}>
         {[
-          { tr: "Dolu Masa", en: "Occupied", val: `${occupiedCount} / ${TABLE_COUNT}` },
-          { tr: "Bekleyen", en: "Pending", val: pendingCount },
-          { tr: "Toplam Ciro", en: "Revenue", val: `₺${totalRevenue.toLocaleString()}` },
+          { tr: "Dolu Masa", en: "Occupied Tables", val: `${occupiedCount} / ${TABLE_COUNT}` },
+          { tr: "Bekleyen Sipariş", en: "Pending Orders", val: pendingCount },
+          { tr: "Toplam Ciro", en: "Total Revenue", val: `₺${totalRevenue.toLocaleString()} · €${(totalRevenue / LIRA_TO_EURO).toFixed(0)}` },
         ].map(s => (
-          <div key={s.tr} style={{ background: "#f3f0ea", border: "1px solid #e8e2d8", borderRadius: 6, padding: "clamp(8px, 2vh, 10px) clamp(12px, 2vw, 16px)", minWidth: "clamp(120px, 25vw, 140px)" }}>
-            <div className="section-label" style={{ marginBottom: 4, fontSize: "clamp(8px, 1.5vw, 9px)" }}>{s.tr} / {s.en}</div>
-            <div style={{ fontSize: "clamp(16px, 4vw, 18px)", color: "#8b6914", fontWeight: 500 }}>{s.val}</div>
+          <div key={s.tr} style={{ background: "#f3f0ea", border: "1px solid #e8e2d8", borderRadius: 6, padding: "10px 16px", minWidth: 140 }}>
+            <div className="section-label" style={{ marginBottom: 4 }}>{s.tr} / {s.en}</div>
+            <div style={{ fontSize: 18, color: "#8b6914", fontWeight: 500 }}>{s.val}</div>
           </div>
         ))}
       </div>
 
       {/* Floor View */}
       {view === "floor" && (
-        <div style={{ display: "flex", flex: 1, overflow: "hidden", flexDirection: window.innerWidth < 1024 ? "column" : "row" }}>
+        <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
 
           {/* Left: Table grid */}
-          <div style={{ width: window.innerWidth < 1024 ? "100%" : 280, minWidth: window.innerWidth < 1024 ? "auto" : 280, background: "#fff", borderRight: window.innerWidth < 1024 ? "none" : "1px solid #d8d0c0", borderBottom: window.innerWidth < 1024 ? "1px solid #d8d0c0" : "none", overflowY: window.innerWidth < 1024 ? "auto" : "auto", padding: "clamp(12px, 3vw, 16px)", maxHeight: window.innerWidth < 1024 ? 200 : "auto" }}>
+          <div style={{ width: 280, minWidth: 280, background: "#fff", borderRight: "1px solid #d8d0c0", overflowY: "auto", padding: 16 }}>
             <div className="section-label">Plan · Floor</div>
-            <div style={{ display: "grid", gridTemplateColumns: window.innerWidth < 480 ? "repeat(4, 1fr)" : window.innerWidth < 768 ? "repeat(5, 1fr)" : "repeat(3, 1fr)", gap: "clamp(5px, 2vw, 7px)" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 7 }}>
               {tables.map(table => {
                 const dot = table.status === "bill" ? "#b06060" : table.status === "occupied" ? "#8b6914" : "#b0c0b0";
                 return (
-                  <div key={table.id} className={`table-card ${table.status}${selectedTable === table.id ? " selected" : ""}`} onClick={() => setSelectedTable(selectedTable === table.id ? null : table.id)} style={{ fontSize: "clamp(12px, 3vw, 16px)", padding: "clamp(8px, 2vh, 10px)" }}>
+                  <div key={table.id} className={`table-card ${table.status}${selectedTable === table.id ? " selected" : ""}`} onClick={() => setSelectedTable(selectedTable === table.id ? null : table.id)}>
                     <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 4, marginBottom: 2 }}>
                       <span style={{ width: 6, height: 6, borderRadius: "50%", background: dot, display: "inline-block" }} />
-                      <span style={{ fontSize: "clamp(14px, 4vw, 16px)", fontWeight: 500, color: "#5a5040" }}>{table.id}</span>
+                      <span style={{ fontSize: 16, fontWeight: 500, color: "#5a5040" }}>{table.id}</span>
                     </div>
                     {table.status !== "free"
-                      ? <><div style={{ fontSize: "clamp(9px, 2vw, 10px)", color: "#9a8e7e", fontFamily: "'DM Mono',monospace" }}>{table.guests} kişi</div>
-                          <div style={{ fontSize: "clamp(10px, 2.5vw, 11px)", color: "#8b6914", fontFamily: "'DM Mono',monospace", marginTop: 2 }}>₺{getTotal(table.id).toLocaleString()}</div></>
-                      : <div style={{ fontSize: "clamp(9px, 2vw, 10px)", color: "#c0bab0" }}>Boş</div>}
+                      ? <><div style={{ fontSize: 10, color: "#9a8e7e", fontFamily: "'DM Mono',monospace" }}>{table.guests} kişi</div>
+                          <div style={{ fontSize: 11, color: "#8b6914", fontFamily: "'DM Mono',monospace", marginTop: 2 }}>₺{getTotal(table.id).toLocaleString()}</div></>
+                      : <div style={{ fontSize: 10, color: "#c0bab0" }}>Boş/Free</div>}
                   </div>
                 );
               })}
@@ -513,81 +351,88 @@ export default function ArastaAtesi() {
           </div>
 
           {/* Middle: Order panel */}
-          <div style={{ flex: 1, overflowY: "auto", background: "#f3f0ea", borderRight: window.innerWidth < 1024 ? "none" : "1px solid #d8d0c0" }}>
-            <div style={{ padding: "clamp(12px, 3vw, 20px)" }}>
+          <div style={{ flex: 1, overflowY: "auto", background: "#f3f0ea", borderRight: "1px solid #d8d0c0" }}>
+            <div style={{ padding: 20 }}>
               {!selectedTable
-                ? <div style={{ textAlign: "center", padding: "40px 16px", color: "#9a8e7e" }}>
+                ? <div style={{ textAlign: "center", padding: "60px 20px", color: "#9a8e7e" }}>
                     <div style={{ fontSize: 32, marginBottom: 8 }}>🪑</div>
-                    <p style={{ fontStyle: "italic", fontSize: "clamp(12px, 3vw, 14px)" }}>Bir masa seçin · Select a table</p>
+                    <p style={{ fontStyle: "italic", fontSize: 14 }}>Bir masa seçin · Select a table</p>
                   </div>
                 : selectedTableData?.status === "free"
-                ? <div style={{ background: "#fff", border: "1px solid #d8d0c0", borderRadius: 8, padding: "clamp(20px, 5vh, 28px)", textAlign: "center" }}>
-                    <div style={{ fontSize: "clamp(18px, 5vw, 22px)", color: "#8b6914", marginBottom: 4 }}>Masa {selectedTable}</div>
-                    <p style={{ fontSize: "clamp(12px, 3vw, 13px)", color: "#9a8e7e", fontStyle: "italic", marginBottom: 16 }}>Misafir sayısı</p>
-                    <div style={{ display: "flex", gap: 8, alignItems: "center", justifyContent: "center", flexWrap: "wrap" }}>
-                      <input type="number" min={1} max={30} value={guestInput} onChange={e => setGuestInput(e.target.value)} style={{ width: "clamp(70px, 20vw, 80px)" }} />
-                      <button className="btn primary" onClick={() => openTable(selectedTable)} style={{ fontSize: "clamp(12px, 3vw, 13px)" }}>Masayı Aç</button>
+                ? <div style={{ background: "#fff", border: "1px solid #d8d0c0", borderRadius: 8, padding: 28, textAlign: "center" }}>
+                    <div style={{ fontSize: 22, color: "#8b6914", marginBottom: 4 }}>Masa {selectedTable} · Table {selectedTable}</div>
+                    <p style={{ fontSize: 13, color: "#9a8e7e", fontStyle: "italic", marginBottom: 20 }}>Misafir sayısını girin · Enter guest count</p>
+                    <div style={{ display: "flex", gap: 10, alignItems: "center", justifyContent: "center" }}>
+                      <input type="number" min={1} max={30} value={guestInput} onChange={e => setGuestInput(e.target.value)} style={{ width: 80 }} />
+                      <button className="btn primary" onClick={() => openTable(selectedTable)}>Masayı Aç · Open Table</button>
                     </div>
                   </div>
                 : <>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 12, flexWrap: "wrap", gap: 8 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 }}>
                       <div>
-                        <div style={{ fontSize: "clamp(16px, 5vw, 20px)", color: "#8b6914", fontWeight: 500 }}>Masa {selectedTable}</div>
-                        <div style={{ fontSize: "clamp(11px, 2vw, 12px)", color: "#9a8e7e", fontFamily: "'DM Mono',monospace" }}>{selectedTableData?.guests} misafir</div>
+                        <div style={{ fontSize: 20, color: "#8b6914", fontWeight: 500 }}>Masa {selectedTable} · Table {selectedTable}</div>
+                        <div style={{ fontSize: 12, color: "#9a8e7e", fontFamily: "'DM Mono',monospace" }}>{selectedTableData?.guests} misafir · guests</div>
                       </div>
-                      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                        <button className="btn warn sm" onClick={() => requestBill(selectedTable)} style={{ fontSize: "clamp(11px, 2vw, 12px)" }}>Hesap</button>
-                        <button className="btn danger sm" onClick={() => closeTable(selectedTable)} style={{ fontSize: "clamp(11px, 2vw, 12px)" }}>Kapat</button>
+                      <div style={{ display: "flex", gap: 6 }}>
+                        <button className="btn warn sm" onClick={() => requestBill(selectedTable)}>Hesap · Bill</button>
+                        <button className="btn danger sm" onClick={() => closeTable(selectedTable)}>Kapat · Close</button>
                       </div>
                     </div>
 
                     <div style={{ background: "#fff", border: "1px solid #e8e2d8", borderRadius: 8, marginBottom: 12, overflow: "hidden" }}>
-                      <div style={{ padding: "clamp(10px, 2vw, 12px) clamp(12px, 3vw, 16px)", borderBottom: "1px solid #ece8df", background: "#faf8f4", display: "flex", justifyContent: "space-between" }}>
-                        <span className="mono" style={{ fontSize: "clamp(10px, 2vw, 11px)", color: "#9a8e7e", letterSpacing: "0.08em" }}>SİPARİŞ</span>
-                        <span className="mono" style={{ fontSize: "clamp(10px, 2vw, 11px)", color: "#9a8e7e" }}>{selectedOrders.length} kalem</span>
+                      <div style={{ padding: "12px 16px", borderBottom: "1px solid #ece8df", background: "#faf8f4", display: "flex", justifyContent: "space-between" }}>
+                        <span className="mono" style={{ fontSize: 11, color: "#9a8e7e", letterSpacing: "0.08em" }}>SİPARİŞ · ORDERS</span>
+                        <span className="mono" style={{ fontSize: 11, color: "#9a8e7e" }}>{selectedOrders.length} kalem · items</span>
                       </div>
                       {selectedOrders.length === 0
-                        ? <div style={{ padding: 16, textAlign: "center", color: "#9a8e7e", fontStyle: "italic", fontSize: "clamp(12px, 3vw, 13px)" }}>Henüz sipariş yok</div>
+                        ? <div style={{ padding: 20, textAlign: "center", color: "#9a8e7e", fontStyle: "italic", fontSize: 13 }}>Henüz sipariş yok · No orders yet</div>
                         : selectedOrders.map(item => (
                           <div key={item.id} className="order-item">
-                            <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "clamp(12px, 3vw, 14px)" }}>
-                              <div style={{ flex: 1, minWidth: 0 }}>
-                                <div style={{ fontSize: "clamp(13px, 3vw, 14px)" }}>{item.name}</div>
-                                <div style={{ fontSize: "clamp(10px, 2vw, 11px)", color: "#9a8e7e", fontStyle: "italic" }}>{item.nameEn}</div>
+                            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                              <div style={{ flex: 1 }}>
+                                <div style={{ fontSize: 14 }}>{item.name}</div>
+                                <div style={{ fontSize: 11, color: "#9a8e7e", fontStyle: "italic" }}>{item.nameEn}</div>
                               </div>
-                              <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
+                              <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
                                 <button className="qty-btn" onClick={() => updateQty(selectedTable, item.id, -1)}>−</button>
-                                <span style={{ minWidth: 20, textAlign: "center", fontFamily: "'DM Mono',monospace", fontSize: "clamp(12px, 3vw, 13px)", color: "#8b6914" }}>{item.qty}</span>
+                                <span style={{ minWidth: 20, textAlign: "center", fontFamily: "'DM Mono',monospace", fontSize: 13, color: "#8b6914" }}>{item.qty}</span>
                                 <button className="qty-btn" onClick={() => updateQty(selectedTable, item.id, 1)}>+</button>
                               </div>
+                              <div style={{ textAlign: "right", minWidth: 90 }}>
+                                <div className="mono" style={{ fontSize: 12, color: "#5a5040" }}>{item.price ? `₺${(item.price * item.qty).toLocaleString()}` : "—"}</div>
+                                <div className="mono" style={{ fontSize: 10, color: "#9a8e7e" }}>{item.price ? `€${((item.price * item.qty) / LIRA_TO_EURO).toFixed(1)}` : ""}</div>
+                              </div>
+                              <span style={{ fontSize: 10, fontFamily: "'DM Mono',monospace", padding: "2px 6px", borderRadius: 3, background: item.status === "served" ? "#f0faf4" : "#faf3e0", color: item.status === "served" ? "#2a6040" : "#8b6914" }}>
+                                {item.status === "served" ? "✓ Geldi" : "⏳ Bekl."}
+                              </span>
                               <button className="qty-btn" style={{ color: "#c09090" }} onClick={() => removeItem(selectedTable, item.id)}>✕</button>
                             </div>
-                            <div style={{ display: "flex", gap: 4, marginTop: 6, alignItems: "center", flexWrap: "wrap" }}>
+                            <div style={{ display: "flex", gap: 6, marginTop: 6, alignItems: "center" }}>
                               <input
                                 type="text"
-                                placeholder="Not"
+                                placeholder="Not · Note..."
                                 defaultValue={item.note}
                                 onBlur={e => updateNote(selectedTable, item.id, e.target.value)}
-                                style={{ flex: 1, fontSize: "clamp(11px, 3vw, 12px)", minWidth: 80 }}
+                                style={{ flex: 1, fontSize: 12 }}
                               />
                               {item.status === "pending" && (
-                                <button className="btn green sm" onClick={() => markServed(selectedTable, item.id)} style={{ fontSize: "clamp(10px, 2vw, 11px)" }}>✓</button>
+                                <button className="btn green sm" onClick={() => markServed(selectedTable, item.id)}>✓ Geldi/Served</button>
                               )}
                             </div>
                           </div>
                         ))}
                     </div>
 
-                    <div style={{ background: "#fff", border: "1px solid #e8e2d8", borderRadius: 8, padding: "clamp(12px, 3vw, 16px)" }}>
-                      <div className="section-label">Fiyat Düzenleme</div>
+                    <div style={{ background: "#fff", border: "1px solid #e8e2d8", borderRadius: 8, padding: 16 }}>
+                      <div className="section-label">Fiyat Düzenleme · Price Adjustment</div>
                       {selectedAdj.length > 0 && (
                         <div style={{ marginBottom: 10 }}>
                           {selectedAdj.map(a => (
-                            <div key={a.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "4px 0", fontSize: "clamp(11px, 2vw, 12px)" }}>
-                              <span style={{ color: "#5a5040" }}>{a.label}</span>
-                              <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                                <span className="mono" style={{ fontSize: "clamp(11px, 2vw, 12px)", color: a.amount >= 0 ? "#2a6040" : "#8b2020" }}>
-                                  {a.amount >= 0 ? "+" : ""}₺{a.amount.toLocaleString()}
+                            <div key={a.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "4px 0" }}>
+                              <span style={{ fontSize: 12, color: "#5a5040" }}>{a.label}</span>
+                              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                                <span className="mono" style={{ fontSize: 12, color: a.amount >= 0 ? "#2a6040" : "#8b2020" }}>
+                                  {a.amount >= 0 ? "+" : ""}₺{a.amount.toLocaleString()} · €{(a.amount / LIRA_TO_EURO).toFixed(1)}
                                 </span>
                                 <span style={{ cursor: "pointer", color: "#9a8e7e", fontSize: 14 }} onClick={() => removeAdjustment(selectedTable, a.id)}>✕</span>
                               </div>
@@ -595,38 +440,36 @@ export default function ArastaAtesi() {
                           ))}
                         </div>
                       )}
-                      <div style={{ display: "flex", gap: 6, marginBottom: 6, flexWrap: "wrap" }}>
-                        <input type="text" placeholder="Açıklama" value={adjLabel} onChange={e => setAdjLabel(e.target.value)} style={{ flex: 1, minWidth: 150, fontSize: "clamp(12px, 3vw, 13px)" }} />
-                        <input type="number" placeholder="₺" value={adjAmount} onChange={e => setAdjAmount(e.target.value)} style={{ width: "clamp(60px, 20vw, 100px)", flexShrink: 0 }} />
+                      <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+                        <input type="text" placeholder="Açıklama · Description" value={adjLabel} onChange={e => setAdjLabel(e.target.value)} style={{ flex: 2 }} />
+                        <input type="number" placeholder="₺ tutar" value={adjAmount} onChange={e => setAdjAmount(e.target.value)} style={{ width: 100, flexShrink: 0 }} />
                       </div>
-                      <div style={{ display: "flex", gap: 4, flexWrap: "wrap", alignItems: "center", marginBottom: 10 }}>
-                        <span className="mono" style={{ fontSize: "clamp(9px, 2vw, 10px)", color: "#9a8e7e" }}>Hızlı:</span>
+                      <div style={{ display: "flex", gap: 5, flexWrap: "wrap", alignItems: "center", marginBottom: 10 }}>
+                        <span className="mono" style={{ fontSize: 10, color: "#9a8e7e" }}>Hızlı/Quick:</span>
                         {QUICK_ADJ.map(v => (
-                          <span key={v} className="adj-chip" onClick={() => quickAdj(selectedTable, v)} style={{ fontSize: "clamp(10px, 2vw, 11px)" }}>{v > 0 ? "+" : ""}₺{v}</span>
+                          <span key={v} className="adj-chip" onClick={() => quickAdj(selectedTable, v)}>{v > 0 ? "+" : ""}₺{v}</span>
                         ))}
+                        <button className="btn green sm" onClick={() => applyAdj(selectedTable, 1)}>+ Ekle/Add</button>
+                        <button className="btn warn sm" onClick={() => applyAdj(selectedTable, -1)}>− İndir/Discount</button>
                       </div>
-                      <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-                        <button className="btn green sm" onClick={() => applyAdj(selectedTable, 1)} style={{ fontSize: "clamp(10px, 2vw, 11px)" }}>+ Ekle</button>
-                        <button className="btn warn sm" onClick={() => applyAdj(selectedTable, -1)} style={{ fontSize: "clamp(10px, 2vw, 11px)" }}>− İndir</button>
-                      </div>
-                      <div style={{ height: 1, background: "#e8e2d8", margin: "10px 0" }} />
-                      <div style={{ display: "flex", justifyContent: "space-between", padding: "3px 0", fontSize: "clamp(11px, 2vw, 12px)" }}>
-                        <span className="mono" style={{ color: "#9a8e7e" }}>Ara Toplam</span>
-                        <span className="mono" style={{ color: "#5a5040" }}>₺{subtotal.toLocaleString()}</span>
+                      <div style={{ height: 1, background: "#e8e2d8", margin: "12px 0" }} />
+                      <div style={{ display: "flex", justifyContent: "space-between", padding: "3px 0" }}>
+                        <span className="mono" style={{ fontSize: 12, color: "#9a8e7e" }}>Ara Toplam / Subtotal</span>
+                        <span className="mono" style={{ fontSize: 13, color: "#5a5040" }}>₺{subtotal.toLocaleString()} · €{(subtotal / LIRA_TO_EURO).toFixed(1)}</span>
                       </div>
                       {adjTotal !== 0 && (
-                        <div style={{ display: "flex", justifyContent: "space-between", padding: "3px 0", fontSize: "clamp(11px, 2vw, 12px)" }}>
-                          <span className="mono" style={{ color: "#9a8e7e" }}>Düzenleme</span>
-                          <span className="mono" style={{ color: adjTotal >= 0 ? "#2a6040" : "#8b2020" }}>
-                            {adjTotal >= 0 ? "+" : ""}₺{adjTotal.toLocaleString()}
+                        <div style={{ display: "flex", justifyContent: "space-between", padding: "3px 0" }}>
+                          <span className="mono" style={{ fontSize: 12, color: "#9a8e7e" }}>Düzenleme / Adjustments</span>
+                          <span className="mono" style={{ fontSize: 13, color: adjTotal >= 0 ? "#2a6040" : "#8b2020" }}>
+                            {adjTotal >= 0 ? "+" : ""}₺{adjTotal.toLocaleString()} · €{(adjTotal / LIRA_TO_EURO).toFixed(1)}
                           </span>
                         </div>
                       )}
                       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", borderTop: "1px solid #e8e2d8", marginTop: 8, paddingTop: 8 }}>
-                        <span className="mono" style={{ fontSize: "clamp(12px, 3vw, 13px)", color: "#1a1710", fontWeight: 500 }}>TOPLAM</span>
+                        <span className="mono" style={{ fontSize: 13, color: "#1a1710", fontWeight: 500 }}>TOPLAM / TOTAL</span>
                         <div style={{ textAlign: "right" }}>
-                          <div className="mono" style={{ fontSize: "clamp(18px, 5vw, 22px)", color: "#8b6914" }}>₺{total.toLocaleString()}</div>
-                          <div className="mono" style={{ fontSize: "clamp(11px, 2vw, 13px)", color: "#9a8e7e" }}>€{(total / LIRA_TO_EURO).toFixed(2)}</div>
+                          <div className="mono" style={{ fontSize: 22, color: "#8b6914" }}>₺{total.toLocaleString()}</div>
+                          <div className="mono" style={{ fontSize: 13, color: "#9a8e7e" }}>€{(total / LIRA_TO_EURO).toFixed(2)}</div>
                         </div>
                       </div>
                     </div>
@@ -636,33 +479,33 @@ export default function ArastaAtesi() {
           </div>
 
           {/* Right: Menu panel */}
-          <div style={{ width: window.innerWidth < 1024 ? "100%" : 320, minWidth: window.innerWidth < 1024 ? "auto" : 280, background: "#fff", display: "flex", flexDirection: "column", overflow: "hidden", borderTop: window.innerWidth < 1024 ? "1px solid #d8d0c0" : "none" }}>
-            <div style={{ padding: "clamp(10px, 2vw, 14px) clamp(12px, 3vw, 16px)", borderBottom: "1px solid #e8e2d8", background: "#faf8f4", flexShrink: 0 }}>
-              <div className="section-label" style={{ marginBottom: 8 }}>Menü</div>
-              <div style={{ display: "flex", gap: 4, overflowX: "auto", paddingBottom: 2 }}>
+          <div style={{ width: 320, minWidth: 280, background: "#fff", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+            <div style={{ padding: "14px 16px", borderBottom: "1px solid #e8e2d8", background: "#faf8f4", flexShrink: 0 }}>
+              <div className="section-label" style={{ marginBottom: 8 }}>Menü · Menu</div>
+              <div style={{ display: "flex", gap: 5, overflowX: "auto", paddingBottom: 2 }}>
                 {CATEGORIES.map(c => (
-                  <button key={c} className={`cat-btn${categoryFilter === c ? " active" : ""}`} onClick={() => setCategoryFilter(c)} style={{ fontSize: "clamp(10px, 2vw, 11px)", padding: "4px 8px" }}>{c.split(" /")[0]}</button>
+                  <button key={c} className={`cat-btn${categoryFilter === c ? " active" : ""}`} onClick={() => setCategoryFilter(c)}>{c}</button>
                 ))}
               </div>
             </div>
             <div style={{ flex: 1, overflowY: "auto" }}>
               {Object.entries(menuByCat).map(([cat, items]) => (
                 <div key={cat}>
-                  <div style={{ padding: "clamp(6px, 2vw, 8px) clamp(12px, 3vw, 16px) clamp(2px, 1vw, 4px)", fontSize: "clamp(8px, 2vw, 9px)", letterSpacing: "0.18em", textTransform: "uppercase", color: "#9a8e7e", fontFamily: "'DM Mono',monospace", background: "#f3f0ea", borderTop: "1px solid #e8e2d8", borderBottom: "1px solid #e8e2d8" }}>{cat}</div>
+                  <div style={{ padding: "8px 16px 4px", fontSize: 9, letterSpacing: "0.18em", textTransform: "uppercase", color: "#9a8e7e", fontFamily: "'DM Mono',monospace", background: "#f3f0ea", borderTop: "1px solid #e8e2d8", borderBottom: "1px solid #e8e2d8" }}>{cat}</div>
                   {items.map(item => (
                     <div key={item.id} className="menu-row" onClick={() => {
                       if (selectedTable && selectedTableData?.status !== "free") { addItem(selectedTable, item); }
-                      else { showToast("Önce bir masa seçin"); }
-                    }} style={{ padding: "clamp(8px, 2vw, 9px) clamp(12px, 3vw, 16px)" }}>
+                      else { showToast("Önce bir masa seçin · Select a table first"); }
+                    }}>
                       <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ fontSize: "clamp(12px, 3vw, 14px)" }}>{item.name}</div>
-                        <div style={{ fontSize: "clamp(10px, 2vw, 11px)", color: "#9a8e7e", fontStyle: "italic", marginTop: 1 }}>{item.nameEn}</div>
+                        <div style={{ fontSize: 14 }}>{item.name}</div>
+                        <div style={{ fontSize: 11, color: "#9a8e7e", fontStyle: "italic", marginTop: 1 }}>{item.nameEn}</div>
                       </div>
-                      <div style={{ textAlign: "right", flexShrink: 0, marginLeft: 8 }}>
+                      <div style={{ textAlign: "right", flexShrink: 0 }}>
                         {item.price
-                          ? <><div className="mono" style={{ fontSize: "clamp(12px, 3vw, 13px)", color: "#8b6914" }}>₺{item.price.toLocaleString()}</div>
-                              <div className="mono" style={{ fontSize: "clamp(9px, 2vw, 10px)", color: "#9a8e7e" }}>€{(item.price / LIRA_TO_EURO).toFixed(1)}</div></>
-                          : <span className="mono" style={{ fontSize: "clamp(10px, 2vw, 11px)", color: "#9a8e7e" }}>Sor</span>}
+                          ? <><div className="mono" style={{ fontSize: 13, color: "#8b6914" }}>₺{item.price.toLocaleString()}</div>
+                              <div className="mono" style={{ fontSize: 10, color: "#9a8e7e" }}>€{(item.price / LIRA_TO_EURO).toFixed(1)}</div></>
+                          : <span className="mono" style={{ fontSize: 11, color: "#9a8e7e" }}>Sor/Ask</span>}
                       </div>
                       <span className="add-icon">+</span>
                     </div>
@@ -676,40 +519,40 @@ export default function ArastaAtesi() {
 
       {/* Kitchen View */}
       {view === "kitchen" && (
-        <div style={{ flex: 1, overflowY: "auto", padding: "clamp(12px, 3vw, 20px)" }}>
-          <div className="section-label" style={{ marginBottom: 12 }}>Mutfak Görünümü · Kitchen View</div>
+        <div style={{ flex: 1, overflowY: "auto", padding: "20px 24px" }}>
+          <div className="section-label" style={{ marginBottom: 16 }}>Mutfak Görünümü · Kitchen View</div>
           {Object.keys(orders).filter(tid => (orders[tid] || []).length > 0).length === 0
-            ? <div style={{ textAlign: "center", padding: "40px 16px", color: "#9a8e7e" }}>
+            ? <div style={{ textAlign: "center", padding: "60px 20px", color: "#9a8e7e" }}>
                 <div style={{ fontSize: 32, marginBottom: 8 }}>🍽️</div>
-                <p style={{ fontStyle: "italic", fontSize: "clamp(12px, 3vw, 14px)" }}>Aktif sipariş yok · No active orders</p>
+                <p style={{ fontStyle: "italic", fontSize: 14 }}>Aktif sipariş yok · No active orders</p>
               </div>
-            : <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(clamp(240px, 70vw, 280px), 1fr))", gap: "clamp(10px, 3vw, 12px)" }}>
+            : <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(280px,1fr))", gap: 12 }}>
                 {Object.entries(orders).filter(([, items]) => items.length > 0).map(([tid, items]) => {
                   const table = tables.find(t => t.id === parseInt(tid));
                   const tot = getTotal(parseInt(tid));
                   return (
                     <div key={tid} style={{ background: "#fff", border: "1px solid #d8d0c0", borderRadius: 8, overflow: "hidden" }}>
-                      <div style={{ padding: "clamp(10px, 2vw, 12px) clamp(12px, 3vw, 16px)", borderBottom: "1px solid #ece8df", background: "#faf8f4", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+                      <div style={{ padding: "12px 16px", borderBottom: "1px solid #ece8df", background: "#faf8f4", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                         <div>
-                          <span style={{ fontSize: "clamp(14px, 4vw, 16px)", color: "#8b6914", fontWeight: 500 }}>Masa {tid}</span>
-                          <span className="mono" style={{ fontSize: "clamp(10px, 2vw, 11px)", color: "#9a8e7e", marginLeft: 8 }}>{table?.guests} kişi</span>
+                          <span style={{ fontSize: 16, color: "#8b6914", fontWeight: 500 }}>Masa {tid} · Table {tid}</span>
+                          <span className="mono" style={{ fontSize: 11, color: "#9a8e7e", marginLeft: 8 }}>{table?.guests} kişi/guests</span>
                         </div>
                         <div style={{ textAlign: "right" }}>
-                          <div className="mono" style={{ fontSize: "clamp(12px, 3vw, 13px)", color: "#8b6914" }}>₺{tot.toLocaleString()}</div>
-                          <div className="mono" style={{ fontSize: "clamp(10px, 2vw, 11px)", color: "#9a8e7e" }}>€{(tot / LIRA_TO_EURO).toFixed(1)}</div>
+                          <div className="mono" style={{ fontSize: 13, color: "#8b6914" }}>₺{tot.toLocaleString()}</div>
+                          <div className="mono" style={{ fontSize: 10, color: "#9a8e7e" }}>€{(tot / LIRA_TO_EURO).toFixed(1)}</div>
                         </div>
                       </div>
                       {items.map(item => (
-                        <div key={item.id} style={{ padding: "clamp(8px, 2vw, 9px) clamp(12px, 3vw, 16px)", borderBottom: "1px solid #ece8df", display: "flex", alignItems: "center", gap: 8, fontSize: "clamp(11px, 2vw, 13px)" }}>
+                        <div key={item.id} style={{ padding: "9px 16px", borderBottom: "1px solid #ece8df", display: "flex", alignItems: "center", gap: 8 }}>
                           <span style={{ width: 7, height: 7, borderRadius: "50%", background: item.status === "served" ? "#2a6040" : "#8b6914", flexShrink: 0, display: "inline-block" }} />
                           <div style={{ flex: 1 }}>
-                            <div style={{ fontSize: "clamp(12px, 3vw, 13px)" }}>{item.qty}× {item.name}</div>
-                            <div style={{ fontSize: "clamp(10px, 2vw, 11px)", color: "#9a8e7e", fontStyle: "italic" }}>{item.nameEn}</div>
-                            {item.note && <div className="mono" style={{ fontSize: "clamp(9px, 2vw, 10px)", color: "#9a8e7e", marginTop: 2 }}>📝 {item.note}</div>}
+                            <div style={{ fontSize: 13 }}>{item.qty}× {item.name}</div>
+                            <div style={{ fontSize: 11, color: "#9a8e7e", fontStyle: "italic" }}>{item.nameEn}</div>
+                            {item.note && <div className="mono" style={{ fontSize: 10, color: "#9a8e7e", marginTop: 2 }}>📝 {item.note}</div>}
                           </div>
                           {item.status === "pending"
-                            ? <button className="btn primary sm" onClick={() => markServed(parseInt(tid), item.id)} style={{ fontSize: "clamp(10px, 2vw, 11px)", flexShrink: 0 }}>✓</button>
-                            : <span className="mono" style={{ fontSize: "clamp(10px, 2vw, 11px)", color: "#2a6040", flexShrink: 0 }}>Geldi</span>}
+                            ? <button className="btn primary sm" onClick={() => markServed(parseInt(tid), item.id)}>✓</button>
+                            : <span className="mono" style={{ fontSize: 11, color: "#2a6040" }}>Geldi/Served</span>}
                         </div>
                       ))}
                     </div>
@@ -718,7 +561,6 @@ export default function ArastaAtesi() {
               </div>}
         </div>
       )}
-
     </div>
   );
 }
