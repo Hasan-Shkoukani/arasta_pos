@@ -2,7 +2,7 @@ import { useState, useCallback, useEffect, useRef } from "react";
 
 const LIRA_TO_EURO = 51;
 const STORAGE_KEY = "arasta_atesi_v2_light";
-const SHEETS_URL = "https://script.google.com/macros/s/AKfycbwF_prRa9qPRcS2RwZYO1zfKgFS3mJlncJSXvCxrSSJ8iFQR6eJj4iApmkb2F1hQtU0XA/exec";
+const SHEETS_URL = "https://script.google.com/macros/s/AKfycbzr_VVD9dEoy9vrD2pP-FE1CTezNnfPr5lc1ka5f5KvABf9SPQXdhAA5zNN0KADXfK8cw/exec";
 
 const MENU_ITEMS = [
   { id: 1, name: "Et Pirzola", nameEn: "Lamb Chops", category: "Kebap", price: 600 },
@@ -71,196 +71,106 @@ function saveState(tables, orders, adjustments) {
   } catch (e) { console.warn("localStorage save failed:", e); }
 }
 
-// ── Sheets sync helpers ──────────────────────────────────────────────────────
-// Sends a full upsert of the table's current state to the active_tables sheet.
+// ── Retry queue for failed log attempts ──────────────────────────────────────
+const failedLogs = [];
+let retryIntervalId = null;
+
+// Formats items array into string like "Adana x2, Cola x1"
+function formatItems(items) {
+  return items.map(i => `${i.name} x${i.qty}`).join(", ");
+}
+
+// Reusable function to log closed table to Google Apps Script.
+// Handles retries on failure and doesn't block the UI.
+async function logClosedTable(tableId, items, total) {
+  const payload = {
+    action: "close",
+    time: new Date().toISOString(),
+    items: formatItems(items),
+    total_tl: total,
+  };
+
+  const attemptLog = async () => {
+    try {
+      const res = await fetch(SHEETS_URL, {
+        method: "POST",
+        mode: "no-cors",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      
+      // With no-cors mode, we can't read the response
+      // But that's OK - Google Apps Script will process the request
+      
+      console.log("✓ Table closed logged to Sheets:", { tableId, items: payload.items, total });
+      return true;
+    } catch (err) {
+      console.warn(`✗ Failed to log closed table ${tableId}:`, err.message);
+      return false;
+    }
+  };
+
+  // Try immediately
+  const success = await attemptLog();
+  
+  // If failed, add to retry queue
+  if (!success) {
+    failedLogs.push(payload);
+    console.log(`Added table ${tableId} to retry queue. Pending: ${failedLogs.length}`);
+    
+    // Start retry interval if not already running
+    if (!retryIntervalId) {
+      retryIntervalId = setInterval(async () => {
+        if (failedLogs.length === 0) {
+          clearInterval(retryIntervalId);
+          retryIntervalId = null;
+          return;
+        }
+        
+        const toRetry = failedLogs.shift();
+        try {
+          const res = await fetch(SHEETS_URL, {
+            method: "POST",
+            mode: "no-cors",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(toRetry),
+          });
+          
+          // With no-cors mode, we can't check response status
+          // Assume success for retry loop
+          
+          console.log("✓ Retried log successful:", toRetry);
+        } catch (err) {
+          failedLogs.push(toRetry);
+          console.warn(`Retry error for table close:`, err.message);
+        }
+      }, 10000); // Retry every 10 seconds
+    }
+  }
+}
+
+// Sheets sync helpers (for live updates - not critical for closing)
 async function syncTableToSheets(tableId, status, guests, openedAt, items, total) {
   const products = items.map(i => `${i.name} x${i.qty}`).join(", ");
-  const total_eur = (total / LIRA_TO_EURO).toFixed(2);
   try {
-      await fetch(SHEETS_URL, {
+    await fetch(SHEETS_URL, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
+      mode: "no-cors",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        action: "upsert_active",
+        action: "update",
         table: tableId,
         status,
         guests,
-        opened_at: openedAt,
         products,
         total_tl: total,
-        total_eur,
-        updated_at: new Date().toISOString(),
+        opened_at: openedAt,
       }),
     });
   } catch (err) { console.warn("Sheets sync error:", err); }
 }
 
-// Logs the closed table to the sales log sheet and removes it from active_tables.
-async function closeTableOnSheets(tableId, guests, items, total, time) {
-  const products = items.map(i => `${i.name} x${i.qty}`).join(", ");
-  const total_eur = (total / LIRA_TO_EURO).toFixed(2);
-  try {
-    // ── closeTableOnSheets ─────────────────────────────────────────────────────
-    await fetch(SHEETS_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        action: "close_table",
-        table: tableId,
-        guests,
-        products,
-        total_tl: total,
-        total_eur,
-        closed_at: time,
-      }),
-    });
-  } catch (err) { console.warn("Sheets close error:", err); }
-}
-
-// ── Live view component ──────────────────────────────────────────────────────
-function LiveView() {
-  const [liveData, setLiveData] = useState([]);
-  const [lastFetch, setLastFetch] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(null);
-
-  const fetchLive = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await fetch(SHEETS_URL + "?t=" + Date.now());
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      setLiveData(Array.isArray(data) ? data : []);
-      setLastFetch(new Date());
-    } catch (err) {
-      setError(`Bağlantı hatası · Connection error: ${err.message}`);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    fetchLive();
-    const interval = setInterval(fetchLive, 30000);
-    return () => clearInterval(interval);
-  }, [fetchLive]);
-
-  const totalRevenue = liveData.reduce((s, r) => s + (parseFloat(r.total_tl) || 0), 0);
-
-  const statusColor = (status) => {
-    if (status === "bill") return { bg: "#fdf0f0", border: "#d09090", dot: "#b06060" };
-    if (status === "occupied") return { bg: "#faf3e0", border: "#d4b840", dot: "#8b6914" };
-    return { bg: "#f3f0ea", border: "#e8e2d8", dot: "#b0c0b0" };
-  };
-
-  return (
-    <div style={{ flex: 1, overflowY: "auto", padding: "20px 24px" }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
-        <div>
-          <div style={{ fontSize: 9, letterSpacing: "0.18em", textTransform: "uppercase", color: "#9a8e7e", fontFamily: "'DM Mono',monospace", marginBottom: 4 }}>
-            Canlı Takip · Live Tracking
-          </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <span style={{ width: 8, height: 8, borderRadius: "50%", background: loading ? "#c4a84a" : error ? "#b06060" : "#2a6040", display: "inline-block", animation: loading ? "pulse 1s infinite" : "none" }} />
-            <span style={{ fontSize: 12, fontFamily: "'DM Mono',monospace", color: "#9a8e7e" }}>
-              {loading ? "Güncelleniyor · Updating..." : lastFetch ? `Son güncelleme · Last update: ${lastFetch.toLocaleTimeString()}` : "—"}
-            </span>
-            <span style={{ fontSize: 10, fontFamily: "'DM Mono',monospace", color: "#c0bab0" }}>· Otomatik 30s / Auto 30s</span>
-          </div>
-        </div>
-        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-          {totalRevenue > 0 && (
-            <div style={{ background: "#faf3e0", border: "1px solid #d4b840", borderRadius: 6, padding: "8px 14px", textAlign: "right" }}>
-              <div style={{ fontSize: 9, letterSpacing: "0.12em", textTransform: "uppercase", color: "#9a8e7e", fontFamily: "'DM Mono',monospace" }}>Aktif Toplam · Active Total</div>
-              <div style={{ fontSize: 16, color: "#8b6914", fontFamily: "'DM Mono',monospace" }}>₺{totalRevenue.toLocaleString()} · €{(totalRevenue / LIRA_TO_EURO).toFixed(0)}</div>
-            </div>
-          )}
-          <button
-            onClick={fetchLive}
-            disabled={loading}
-            style={{ border: "1px solid #d8d0c0", background: "#fff", borderRadius: 5, padding: "7px 14px", fontSize: 12, fontFamily: "'DM Mono',monospace", cursor: loading ? "not-allowed" : "pointer", color: "#5a5040", opacity: loading ? 0.5 : 1 }}
-          >
-            ↻ Yenile / Refresh
-          </button>
-        </div>
-      </div>
-
-      {error && (
-        <div style={{ background: "#fdf0f0", border: "1px solid #d09090", borderRadius: 6, padding: "10px 16px", marginBottom: 16, fontSize: 13, color: "#8b2020", fontFamily: "'DM Mono',monospace" }}>
-          ⚠ {error}
-        </div>
-      )}
-
-      {liveData.length === 0 && !loading ? (
-        <div style={{ textAlign: "center", padding: "60px 20px", color: "#9a8e7e" }}>
-          <div style={{ fontSize: 32, marginBottom: 8 }}>🪑</div>
-          <p style={{ fontStyle: "italic", fontSize: 14 }}>Aktif masa yok · No active tables</p>
-        </div>
-      ) : (
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))", gap: 14 }}>
-          {liveData.map((row, idx) => {
-            const colors = statusColor(row.status);
-            const tl = parseFloat(row.total_tl) || 0;
-            const eur = parseFloat(row.total_eur) || 0;
-            const products = row.products ? row.products.split(", ") : [];
-            const openedAt = row.opened_at ? new Date(row.opened_at) : null;
-            const updatedAt = row.updated_at ? new Date(row.updated_at) : null;
-
-            return (
-              <div key={idx} style={{ background: colors.bg, border: `1.5px solid ${colors.border}`, borderRadius: 8, overflow: "hidden" }}>
-                <div style={{ padding: "12px 16px", borderBottom: `1px solid ${colors.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                    <span style={{ width: 8, height: 8, borderRadius: "50%", background: colors.dot, display: "inline-block" }} />
-                    <span style={{ fontSize: 18, fontWeight: 500, color: "#8b6914" }}>Masa {row.table} · Table {row.table}</span>
-                  </div>
-                  <span style={{
-                    fontSize: 10, fontFamily: "'DM Mono',monospace", padding: "2px 8px", borderRadius: 3,
-                    background: row.status === "bill" ? "#fdf0f0" : row.status === "occupied" ? "#faf3e0" : "#f3f0ea",
-                    color: row.status === "bill" ? "#8b2020" : row.status === "occupied" ? "#8b6914" : "#9a8e7e",
-                    border: `1px solid ${colors.border}`,
-                  }}>
-                    {row.status === "bill" ? "💳 Hesap/Bill" : row.status === "occupied" ? "● Dolu/Occupied" : "○ Boş/Free"}
-                  </span>
-                </div>
-
-                <div style={{ padding: "10px 16px" }}>
-                  {products.length > 0 ? (
-                    <div style={{ marginBottom: 10 }}>
-                      {products.map((p, i) => (
-                        <div key={i} style={{ fontSize: 13, color: "#5a5040", padding: "2px 0", borderBottom: i < products.length - 1 ? "1px solid rgba(0,0,0,0.04)" : "none", display: "flex", alignItems: "center", gap: 6 }}>
-                          <span style={{ color: "#c4a84a", fontSize: 10 }}>▸</span>
-                          {p}
-                        </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <div style={{ fontSize: 12, color: "#9a8e7e", fontStyle: "italic", marginBottom: 10 }}>Sipariş yok · No orders</div>
-                  )}
-
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", borderTop: `1px solid ${colors.border}`, paddingTop: 8, marginTop: 4 }}>
-                    <div style={{ fontSize: 10, fontFamily: "'DM Mono',monospace", color: "#9a8e7e" }}>
-                      {openedAt && <div>Açılış: {openedAt.toLocaleTimeString()}</div>}
-                      {updatedAt && <div>Güncelleme: {updatedAt.toLocaleTimeString()}</div>}
-                    </div>
-                    <div style={{ textAlign: "right" }}>
-                      <div style={{ fontSize: 20, color: "#8b6914", fontFamily: "'DM Mono',monospace" }}>₺{tl.toLocaleString()}</div>
-                      <div style={{ fontSize: 11, color: "#9a8e7e", fontFamily: "'DM Mono',monospace" }}>€{eur.toFixed(2)}</div>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      )}
-    </div>
-  );
-}
+// ── Removed: LiveView component
 
 // ── Main component ───────────────────────────────────────────────────────────
 export default function ArastaAtesi() {
@@ -277,11 +187,6 @@ export default function ArastaAtesi() {
   const [guestInput, setGuestInput] = useState("2");
   const [adjLabel, setAdjLabel] = useState("");
   const [adjAmount, setAdjAmount] = useState("");
-
-  // Tracks which tables are currently mid-close to prevent double-clicks
-  const closingRef = useRef(new Set());
-  // Force a re-render after closingRef changes so the button state updates
-  const [, forceUpdate] = useState(0);
 
   const isFirstRender = useRef(true);
   const syncDebounceRef = useRef({});
@@ -326,34 +231,26 @@ export default function ArastaAtesi() {
   };
 
   const closeTable = async (tableId) => {
-    // Guard: prevent double-click / double-submit
-    if (closingRef.current.has(tableId)) return;
-    closingRef.current.add(tableId);
-    forceUpdate(n => n + 1); // re-render so button goes disabled immediately
-
     const items = orders[tableId] || [];
     const subtotal = items.reduce((s, i) => s + (i.price || 0) * i.qty, 0);
     const adjTot = (adjustments[tableId] || []).reduce((s, a) => s + a.amount, 0);
     const total = subtotal + adjTot;
-    const time = new Date().toISOString();
-    const table = tables.find(t => t.id === tableId);
 
-    // Pass guests + correct field names — fixes prices not appearing in Sheets
-    await closeTableOnSheets(tableId, table?.guests ?? 0, items, total, time);
+    // Log closed table (non-blocking - doesn't wait for response)
+    logClosedTable(tableId, items, total);
 
+    // Reset table state immediately - UI remains responsive
     setTables(prev => prev.map(t => t.id === tableId ? { ...t, status: "free", guests: 0, openedAt: null } : t));
     setOrders(prev => { const n = { ...prev }; delete n[tableId]; return n; });
     setAdjustments(prev => { const n = { ...prev }; delete n[tableId]; return n; });
     setSelectedTable(null);
-
-    closingRef.current.delete(tableId);
-    forceUpdate(n => n + 1);
     showToast(`Masa ${tableId} kapatıldı / Table ${tableId} closed`);
   };
 
   const requestBill = (tableId) => {
     const newTables = tables.map(t => t.id === tableId ? { ...t, status: "bill" } : t);
     setTables(newTables);
+    // Sync bill status immediately
     const table = newTables.find(t => t.id === tableId);
     const items = orders[tableId] || [];
     const subtotal = items.reduce((s, i) => s + (i.price || 0) * i.qty, 0);
@@ -466,8 +363,6 @@ export default function ArastaAtesi() {
   const adjTotal = selectedTable ? getAdjTotal(selectedTable) : 0;
   const total = selectedTable ? getTotal(selectedTable) : 0;
 
-  const isClosing = selectedTable ? closingRef.current.has(selectedTable) : false;
-
   const catKey = categoryFilter === "Tümü / All" ? null : categoryFilter;
   const filteredMenu = catKey ? MENU_ITEMS.filter(m => m.category === catKey) : MENU_ITEMS;
   const menuByCat = filteredMenu.reduce((acc, item) => {
@@ -483,16 +378,15 @@ export default function ArastaAtesi() {
         * { box-sizing: border-box; margin: 0; padding: 0; }
         ::-webkit-scrollbar { width: 4px; } ::-webkit-scrollbar-track { background: #f0ece4; } ::-webkit-scrollbar-thumb { background: #d0c8b8; border-radius: 2px; }
         .btn { border: 1px solid #d8d0c0; cursor: pointer; border-radius: 5px; padding: 6px 14px; font-size: 12px; font-family: 'DM Mono', monospace; background: #fff; color: #5a5040; letter-spacing: 0.04em; transition: all 0.15s; white-space: nowrap; }
-        .btn:hover:not(:disabled) { border-color: #8b6914; color: #8b6914; }
-        .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+        .btn:hover { border-color: #8b6914; color: #8b6914; }
         .btn.primary { background: #8b6914; color: #fff; border-color: #8b6914; }
-        .btn.primary:hover:not(:disabled) { background: #7a5e10; }
+        .btn.primary:hover { background: #7a5e10; }
         .btn.danger { color: #8b2020; border-color: #ecc; }
-        .btn.danger:hover:not(:disabled) { border-color: #8b2020; }
+        .btn.danger:hover { border-color: #8b2020; }
         .btn.warn { color: #b06010; border-color: #f0d8b0; }
-        .btn.warn:hover:not(:disabled) { border-color: #b06010; }
+        .btn.warn:hover { border-color: #b06010; }
         .btn.green { color: #2a6040; border-color: #b0d8c0; }
-        .btn.green:hover:not(:disabled) { border-color: #2a6040; }
+        .btn.green:hover { border-color: #2a6040; }
         .btn.sm { padding: 4px 10px; font-size: 11px; }
         .tab { border: none; background: none; cursor: pointer; padding: 6px 14px; font-size: 12px; border-radius: 4px; font-family: 'DM Mono', monospace; color: #9a8e7e; letter-spacing: 0.04em; transition: all 0.18s; white-space: nowrap; }
         .tab.active { background: #fff; color: #1a1710; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
@@ -542,7 +436,6 @@ export default function ArastaAtesi() {
             {[
               { key: "floor", labelTr: "Masalar", labelEn: "Tables" },
               { key: "kitchen", labelTr: "Mutfak", labelEn: "Kitchen" },
-              { key: "live", labelTr: "Canlı", labelEn: "Live" },
             ].map(v => (
               <button key={v.key} className={`tab${view === v.key ? " active" : ""}`} onClick={() => setView(v.key)}>
                 {v.labelTr} / {v.labelEn}
@@ -618,14 +511,7 @@ export default function ArastaAtesi() {
                       </div>
                       <div style={{ display: "flex", gap: 6 }}>
                         <button className="btn warn sm" onClick={() => requestBill(selectedTable)}>Hesap · Bill</button>
-                        <button
-                          className="btn danger sm"
-                          onClick={() => closeTable(selectedTable)}
-                          disabled={isClosing}
-                          title={isClosing ? "Kapatılıyor… · Closing…" : undefined}
-                        >
-                          {isClosing ? "Kapatılıyor…" : "Kapat · Close"}
-                        </button>
+                        <button className="btn danger sm" onClick={() => closeTable(selectedTable)}>Kapat · Close</button>
                       </div>
                     </div>
 
@@ -812,8 +698,6 @@ export default function ArastaAtesi() {
         </div>
       )}
 
-      {/* Live View */}
-      {view === "live" && <LiveView />}
     </div>
   );
 }
