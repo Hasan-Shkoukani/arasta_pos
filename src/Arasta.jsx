@@ -72,43 +72,50 @@ function saveState(tables, orders, adjustments) {
 }
 
 // ── Sheets sync helpers ──────────────────────────────────────────────────────
+// Sends a full upsert of the table's current state to the active_tables sheet.
 async function syncTableToSheets(tableId, status, guests, openedAt, items, total) {
   const products = items.map(i => `${i.name} x${i.qty}`).join(", ");
   const total_eur = (total / LIRA_TO_EURO).toFixed(2);
   try {
-    await fetch(SHEETS_URL, {
+      await fetch(SHEETS_URL, {
       method: "POST",
-      mode: "no-cors",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+      },
       body: JSON.stringify({
-        action: "update",
+        action: "upsert_active",
         table: tableId,
         status,
         guests,
+        opened_at: openedAt,
         products,
         total_tl: total,
         total_eur,
-        opened_at: openedAt,
+        updated_at: new Date().toISOString(),
       }),
     });
   } catch (err) { console.warn("Sheets sync error:", err); }
 }
 
-async function closeTableOnSheets(tableId, items, total, time) {
+// Logs the closed table to the sales log sheet and removes it from active_tables.
+async function closeTableOnSheets(tableId, guests, items, total, time) {
   const products = items.map(i => `${i.name} x${i.qty}`).join(", ");
   const total_eur = (total / LIRA_TO_EURO).toFixed(2);
   try {
+    // ── closeTableOnSheets ─────────────────────────────────────────────────────
     await fetch(SHEETS_URL, {
       method: "POST",
-      mode: "no-cors",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+      },
       body: JSON.stringify({
-        action: "close",
-        time,
+        action: "close_table",
         table: tableId,
+        guests,
         products,
         total_tl: total,
         total_eur,
+        closed_at: time,
       }),
     });
   } catch (err) { console.warn("Sheets close error:", err); }
@@ -125,12 +132,13 @@ function LiveView() {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(SHEETS_URL);
+      const res = await fetch(SHEETS_URL + "?t=" + Date.now());
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       setLiveData(Array.isArray(data) ? data : []);
       setLastFetch(new Date());
     } catch (err) {
-      setError("Bağlantı hatası · Connection error");
+      setError(`Bağlantı hatası · Connection error: ${err.message}`);
     } finally {
       setLoading(false);
     }
@@ -152,14 +160,13 @@ function LiveView() {
 
   return (
     <div style={{ flex: 1, overflowY: "auto", padding: "20px 24px" }}>
-      {/* Live header bar */}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
         <div>
           <div style={{ fontSize: 9, letterSpacing: "0.18em", textTransform: "uppercase", color: "#9a8e7e", fontFamily: "'DM Mono',monospace", marginBottom: 4 }}>
             Canlı Takip · Live Tracking
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <span style={{ width: 8, height: 8, borderRadius: "50%", background: loading ? "#c4a84a" : "#2a6040", display: "inline-block", animation: loading ? "pulse 1s infinite" : "none" }} />
+            <span style={{ width: 8, height: 8, borderRadius: "50%", background: loading ? "#c4a84a" : error ? "#b06060" : "#2a6040", display: "inline-block", animation: loading ? "pulse 1s infinite" : "none" }} />
             <span style={{ fontSize: 12, fontFamily: "'DM Mono',monospace", color: "#9a8e7e" }}>
               {loading ? "Güncelleniyor · Updating..." : lastFetch ? `Son güncelleme · Last update: ${lastFetch.toLocaleTimeString()}` : "—"}
             </span>
@@ -206,7 +213,6 @@ function LiveView() {
 
             return (
               <div key={idx} style={{ background: colors.bg, border: `1.5px solid ${colors.border}`, borderRadius: 8, overflow: "hidden" }}>
-                {/* Card header */}
                 <div style={{ padding: "12px 16px", borderBottom: `1px solid ${colors.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                     <span style={{ width: 8, height: 8, borderRadius: "50%", background: colors.dot, display: "inline-block" }} />
@@ -222,7 +228,6 @@ function LiveView() {
                   </span>
                 </div>
 
-                {/* Items */}
                 <div style={{ padding: "10px 16px" }}>
                   {products.length > 0 ? (
                     <div style={{ marginBottom: 10 }}>
@@ -237,7 +242,6 @@ function LiveView() {
                     <div style={{ fontSize: 12, color: "#9a8e7e", fontStyle: "italic", marginBottom: 10 }}>Sipariş yok · No orders</div>
                   )}
 
-                  {/* Total */}
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", borderTop: `1px solid ${colors.border}`, paddingTop: 8, marginTop: 4 }}>
                     <div style={{ fontSize: 10, fontFamily: "'DM Mono',monospace", color: "#9a8e7e" }}>
                       {openedAt && <div>Açılış: {openedAt.toLocaleTimeString()}</div>}
@@ -273,6 +277,11 @@ export default function ArastaAtesi() {
   const [guestInput, setGuestInput] = useState("2");
   const [adjLabel, setAdjLabel] = useState("");
   const [adjAmount, setAdjAmount] = useState("");
+
+  // Tracks which tables are currently mid-close to prevent double-clicks
+  const closingRef = useRef(new Set());
+  // Force a re-render after closingRef changes so the button state updates
+  const [, forceUpdate] = useState(0);
 
   const isFirstRender = useRef(true);
   const syncDebounceRef = useRef({});
@@ -317,25 +326,34 @@ export default function ArastaAtesi() {
   };
 
   const closeTable = async (tableId) => {
+    // Guard: prevent double-click / double-submit
+    if (closingRef.current.has(tableId)) return;
+    closingRef.current.add(tableId);
+    forceUpdate(n => n + 1); // re-render so button goes disabled immediately
+
     const items = orders[tableId] || [];
     const subtotal = items.reduce((s, i) => s + (i.price || 0) * i.qty, 0);
     const adjTot = (adjustments[tableId] || []).reduce((s, a) => s + a.amount, 0);
     const total = subtotal + adjTot;
     const time = new Date().toISOString();
+    const table = tables.find(t => t.id === tableId);
 
-    await closeTableOnSheets(tableId, items, total, time);
+    // Pass guests + correct field names — fixes prices not appearing in Sheets
+    await closeTableOnSheets(tableId, table?.guests ?? 0, items, total, time);
 
     setTables(prev => prev.map(t => t.id === tableId ? { ...t, status: "free", guests: 0, openedAt: null } : t));
     setOrders(prev => { const n = { ...prev }; delete n[tableId]; return n; });
     setAdjustments(prev => { const n = { ...prev }; delete n[tableId]; return n; });
     setSelectedTable(null);
+
+    closingRef.current.delete(tableId);
+    forceUpdate(n => n + 1);
     showToast(`Masa ${tableId} kapatıldı / Table ${tableId} closed`);
   };
 
   const requestBill = (tableId) => {
     const newTables = tables.map(t => t.id === tableId ? { ...t, status: "bill" } : t);
     setTables(newTables);
-    // Sync bill status immediately
     const table = newTables.find(t => t.id === tableId);
     const items = orders[tableId] || [];
     const subtotal = items.reduce((s, i) => s + (i.price || 0) * i.qty, 0);
@@ -448,6 +466,8 @@ export default function ArastaAtesi() {
   const adjTotal = selectedTable ? getAdjTotal(selectedTable) : 0;
   const total = selectedTable ? getTotal(selectedTable) : 0;
 
+  const isClosing = selectedTable ? closingRef.current.has(selectedTable) : false;
+
   const catKey = categoryFilter === "Tümü / All" ? null : categoryFilter;
   const filteredMenu = catKey ? MENU_ITEMS.filter(m => m.category === catKey) : MENU_ITEMS;
   const menuByCat = filteredMenu.reduce((acc, item) => {
@@ -463,15 +483,16 @@ export default function ArastaAtesi() {
         * { box-sizing: border-box; margin: 0; padding: 0; }
         ::-webkit-scrollbar { width: 4px; } ::-webkit-scrollbar-track { background: #f0ece4; } ::-webkit-scrollbar-thumb { background: #d0c8b8; border-radius: 2px; }
         .btn { border: 1px solid #d8d0c0; cursor: pointer; border-radius: 5px; padding: 6px 14px; font-size: 12px; font-family: 'DM Mono', monospace; background: #fff; color: #5a5040; letter-spacing: 0.04em; transition: all 0.15s; white-space: nowrap; }
-        .btn:hover { border-color: #8b6914; color: #8b6914; }
+        .btn:hover:not(:disabled) { border-color: #8b6914; color: #8b6914; }
+        .btn:disabled { opacity: 0.4; cursor: not-allowed; }
         .btn.primary { background: #8b6914; color: #fff; border-color: #8b6914; }
-        .btn.primary:hover { background: #7a5e10; }
+        .btn.primary:hover:not(:disabled) { background: #7a5e10; }
         .btn.danger { color: #8b2020; border-color: #ecc; }
-        .btn.danger:hover { border-color: #8b2020; }
+        .btn.danger:hover:not(:disabled) { border-color: #8b2020; }
         .btn.warn { color: #b06010; border-color: #f0d8b0; }
-        .btn.warn:hover { border-color: #b06010; }
+        .btn.warn:hover:not(:disabled) { border-color: #b06010; }
         .btn.green { color: #2a6040; border-color: #b0d8c0; }
-        .btn.green:hover { border-color: #2a6040; }
+        .btn.green:hover:not(:disabled) { border-color: #2a6040; }
         .btn.sm { padding: 4px 10px; font-size: 11px; }
         .tab { border: none; background: none; cursor: pointer; padding: 6px 14px; font-size: 12px; border-radius: 4px; font-family: 'DM Mono', monospace; color: #9a8e7e; letter-spacing: 0.04em; transition: all 0.18s; white-space: nowrap; }
         .tab.active { background: #fff; color: #1a1710; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
@@ -597,7 +618,14 @@ export default function ArastaAtesi() {
                       </div>
                       <div style={{ display: "flex", gap: 6 }}>
                         <button className="btn warn sm" onClick={() => requestBill(selectedTable)}>Hesap · Bill</button>
-                        <button className="btn danger sm" onClick={() => closeTable(selectedTable)}>Kapat · Close</button>
+                        <button
+                          className="btn danger sm"
+                          onClick={() => closeTable(selectedTable)}
+                          disabled={isClosing}
+                          title={isClosing ? "Kapatılıyor… · Closing…" : undefined}
+                        >
+                          {isClosing ? "Kapatılıyor…" : "Kapat · Close"}
+                        </button>
                       </div>
                     </div>
 
