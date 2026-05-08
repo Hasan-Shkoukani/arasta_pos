@@ -117,21 +117,15 @@ export default function ArastaAtesi() {
   const total = getTotal(tableId);
 
   try {
-    await fetch(
-      "https://script.google.com/macros/s/AKfycbwF_prRa9qPRcS2RwZYO1zfKgFS3mJlncJSXvCxrSSJ8iFQR6eJj4iApmkb2F1hQtU0XA/exec",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          time: new Date().toISOString(),
-          table: tableId,
-          products,
-          total_price: total,
-        }),
-      }
-    );
+    await fetch("https://script.google.com/macros/s/AKfycbwF_prRa9qPRcS2RwZYO1zfKgFS3mJlncJSXvCxrSSJ8iFQR6eJj4iApmkb2F1hQtU0XA/exec", {
+      method: "POST",
+      body: JSON.stringify({
+        time: new Date().toISOString(),
+        table: tableId,
+        products,
+        total_price: total,
+      }),
+    });
   } catch (err) {
     console.error("Google Sheets error:", err);
   }
